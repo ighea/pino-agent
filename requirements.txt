@@ -1,0 +1,12 @@
+openai>=1.0.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+apscheduler>=3.10.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+matrix-nio[e2e]>=0.21.0
+trafilatura>=1.6.0
+markdown>=3.5.0
+icalendar>=5.0.0
+recurring-ical-events>=3.0.0
+pypdf>=4.0.0
