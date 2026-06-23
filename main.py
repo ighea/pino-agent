@@ -61,7 +61,9 @@ DAILY_BRIEFING_TIME = os.getenv("DAILY_BRIEFING_TIME", "")
 DAILY_BRIEFING_TZ = os.getenv("DAILY_BRIEFING_TZ", "UTC")
 DAILY_BRIEFING_PROMPT = os.getenv(
     "DAILY_BRIEFING_PROMPT",
-    "Provide a concise morning briefing. Check today's calendar events and give a friendly summary of the day ahead.",
+    "Use recall_memory to find the user's home location and any relevant preferences. "
+    "Then provide a concise morning briefing: get the weather for that location, "
+    "check today's calendar events, and give a friendly summary of the day ahead.",
 )
 
 
