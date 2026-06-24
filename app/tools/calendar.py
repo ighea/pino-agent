@@ -37,6 +37,8 @@ def _fetch_calendar(name: str, url: str, now: datetime.datetime, end: datetime.d
 
     results = []
     for event in events:
+        if str(event.get("STATUS", "")).upper() == "CANCELLED":
+            continue
         dt = event.get("DTSTART").dt
         results.append({
             "calendar": name,
