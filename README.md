@@ -1,6 +1,6 @@
 # Pino
 
-Pino is a self-hosted AI agent with persistent memory, a pluggable tool system, and support for multiple simultaneous input channels. Input arrives through **triggers** (CLI, HTTP, Matrix), gets processed by an async agent loop backed by an OpenAI-compatible LLM, and results are routed back through the same trigger. A built-in scheduler enables proactive features — reminders and a daily briefing — that the agent can deliver unprompted.
+Pino is a self-hosted AI agent with persistent memory, a pluggable tool system, and support for multiple simultaneous input channels. Input arrives through **triggers** (CLI, HTTP, Matrix), gets processed by an async agent loop backed by an OpenAI-compatible LLM, and results are routed back through the same trigger. A built-in scheduler enables proactive features — reminders, URL monitoring, and a daily briefing — that the agent can deliver unprompted.
 
 ## Architecture
 
@@ -8,8 +8,9 @@ Pino is a self-hosted AI agent with persistent memory, a pluggable tool system, 
 Trigger → TriggerEvent → CoreServer → AgentLoop → LLM (Ollama / OpenAI-compatible)
                                                  ↕
                                              ToolManager
-                         (search, weather, fetch, calculate, memory,
-                          react, files, calendar, reminders, background)
+                         (search, weather, fetch, calculate, memory, react,
+                          files, semantic search, code execution, calendar,
+                          reminders, URL monitoring, background tasks)
 
 Scheduler → fire_proactive() → MatrixTrigger → room_send()
 ```
@@ -39,17 +40,23 @@ pip install -r requirements.txt
 | `OPENAI_API_KEY` | `ollama` | API key (`ollama` for local Ollama) |
 | `OPENAI_MODEL` | `gemma4:e4b` | Primary model name |
 | `FAST_MODEL` | `qwen2.5:1.5b` | Quick-acknowledgment model; set empty to disable |
-| `BRAVE_API_KEY` | — | Brave Search API key (required for `search_web`) |
+| `BRAVE_API_KEY` | — | Brave Search API key (required for `search_web` and `search_images`) |
 | `OPENWEATHERMAP_API_KEY` | — | OpenWeatherMap API key (required for `get_weather`) |
 | `AGENT_LOG_FILE` | `data/agent_history.jsonl` | Structured event log path |
 | `MEMORY_FILE` | `data/memory.json` | Path to persistent memory store |
-| `EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model for semantic memory embeddings |
-| `OLLAMA_NUM_CTX` | `8192` | Context window tokens passed to Ollama per request (Ollama default of 2048 is too small for tool use) |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model for semantic memory and workspace search embeddings |
+| `WORKSPACE_DIR` | `data/workspace` | Sandboxed directory for file tools and code execution |
+| `WORKSPACE_INDEX_FILE` | `data/workspace_index.json` | Vector index for `search_files_semantic` |
+| `HISTORY_DIR` | `data/history` | Per-session conversation history files |
+| `MAX_PERSISTED_HISTORY` | `200` | Maximum messages saved per session history file |
+| `WATCHES_FILE` | `data/watches.json` | Persistent URL watch store |
+| `OLLAMA_NUM_CTX` | `8192` | Context window tokens passed to Ollama per request (Ollama default 2048 is too small for tool use) |
 | `MAX_TOOL_RESULT_CHARS` | `3000` | Truncate individual tool results to this length before adding to the message list |
 | `MAX_MESSAGES_CHARS` | auto | Character budget for the messages list; defaults to `OLLAMA_NUM_CTX × 4 − 16000` |
-| `MAX_HISTORY_TURNS` | `20` | Summarize conversation when history exceeds this many turns |
-| `SUMMARY_KEEP_RECENT` | `6` | Keep this many recent turns verbatim after summarization |
-| `WORKSPACE_DIR` | `data/workspace` | Sandboxed directory for file tools |
+| `MAX_HISTORY_CHARS` | `12000` | Trigger conversation summarization when total history character count exceeds this |
+| `SUMMARY_KEEP_CHARS` | `4000` | Target chars of recent history to keep verbatim after summarizing |
+| `CODE_EXEC_TIMEOUT` | `30` | Default `run_python` timeout in seconds (hard cap: 120) |
+| `CODE_MAX_OUTPUT_CHARS` | `3000` | Truncate `run_python` output to this length |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
 | `HTTP_PORT` | `8000` | HTTP trigger port |
 | `HTTP_API_KEY` | — | Bearer token for HTTP auth; unset = open |
@@ -111,9 +118,34 @@ Set `FAST_MODEL=` (empty) to disable. Pull the default model with:
 ollama pull qwen2.5:1.5b
 ```
 
+## Conversation history
+
+Conversation history is persisted per session so it survives process restarts. Each Matrix room and each HTTP `session_id` gets its own file under `HISTORY_DIR` (default: `data/history/`). Up to `MAX_PERSISTED_HISTORY` messages (default 200) are kept per file; older messages are dropped when the file is written.
+
+Concurrent messages to the same room are serialized via a per-room async lock so history is always consistent.
+
 ## Conversation summarization
 
-When conversation history exceeds `MAX_HISTORY_TURNS` (default 20), the agent automatically summarizes older turns into a single system message using the primary LLM. The most recent `SUMMARY_KEEP_RECENT` (default 6) turns are kept verbatim so context is never lost mid-exchange.
+When total history character count exceeds `MAX_HISTORY_CHARS` (default 12 000), the agent automatically summarizes older turns into a single system message using the primary LLM. The most recent `SUMMARY_KEEP_CHARS` (default 4 000) characters of history are kept verbatim, split at a user-message boundary so tool-call chains are never broken mid-sequence. Tool calls and brief tool results are included in the summary prompt so no context is lost.
+
+## Code execution
+
+The agent can run Python code using the `run_python` tool. Code executes in a subprocess with:
+
+- **Workspace-only file I/O** — `open()` is overridden to reject paths outside `WORKSPACE_DIR`; use relative paths or workspace-relative paths freely
+- **Subprocess and shell execution blocked** — `subprocess`, `os.system`, `os.popen`, `os.execv`, and related APIs raise `PermissionError`
+- **CPU time hard limit** — enforced at the OS level via `RLIMIT_CPU` on Linux, in addition to the `timeout` parameter
+- Standard library and all installed packages are available
+
+```text
+> Calculate the 10 largest Fibonacci numbers under 1000 and save them to fib.txt
+
+Running Python code...
+
+Saved 10 Fibonacci numbers to fib.txt
+```
+
+Set `CODE_EXEC_TIMEOUT` (default 30 s, max 120 s) and `CODE_MAX_OUTPUT_CHARS` (default 3000) to tune behaviour.
 
 ## Background tasks
 
@@ -133,6 +165,27 @@ The agent can schedule reminders using the `set_reminder` tool. When a reminder 
 
 Use `list_reminders` to see pending reminders and `cancel_reminder` to remove one by ID.
 
+## URL monitoring
+
+The agent can watch URLs for content changes using `watch_url`. On each check it fetches the URL, hashes the extracted text, and compares it with the stored baseline. When a change is detected a proactive notification is sent with a content excerpt.
+
+```text
+> Watch the Hacker News front page every 30 minutes.
+
+Watching 'Hacker News front page' every 30 minutes (id: a3f9b2c1).
+
+[30 minutes later, if the page changes]
+🔔 Hacker News front page has changed
+https://news.ycombinator.com
+
+Content excerpt:
+Ask HN: What tools do you use for self-hosting?...
+```
+
+- Minimum interval is 5 minutes; maximum is 1 week
+- Watches are persisted to `WATCHES_FILE` and rescheduled on startup
+- Use `list_watches` to see active watches and `unwatch_url` to stop one
+
 ## Calendar
 
 Configure one or more calendars using `CALENDAR_<name>=<ics_url>` environment variables:
@@ -140,21 +193,11 @@ Configure one or more calendars using `CALENDAR_<name>=<ics_url>` environment va
 ```bash
 CALENDAR_PERSONAL=https://calendar.google.com/calendar/ical/…
 CALENDAR_WORK=https://calendar.google.com/calendar/ical/…
-CALENDAR_WIFE=https://calendar.google.com/calendar/ical/…
 ```
 
 Get ICS URLs from Google Calendar → Settings → (calendar) → *Secret address in iCal format*.
 
 The `get_calendar_events` tool fetches upcoming events from all configured calendars (or a named subset), merges them chronologically, and labels each with its calendar name. Recurring events are fully expanded.
-
-```text
-> What's on my calendar this week?
-
-Upcoming events (next 7 days):
-- 2026-06-24 09:00 UTC: Team standup [work] @ Conference room B
-- 2026-06-25 (all day): Midsummer [personal]
-- 2026-06-26 14:00 UTC: Dentist [personal] @ Dental clinic
-```
 
 ## Daily briefing
 
@@ -194,7 +237,7 @@ data: {"type": "file", "path": "report.pdf", "url": "http://localhost:8000/files
 data: {"type": "output", "text": "Done — your report is ready to download."}
 ```
 
-Pass `session_id` to maintain conversation history across requests:
+Pass `session_id` to maintain conversation history across requests. History is persisted to disk so it survives server restarts:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/run \
@@ -274,6 +317,7 @@ All users in a room share the same conversation history. The agent sees messages
 | Tool | What it does | Requires |
 | --- | --- | --- |
 | `search_web(query)` | Brave Search — returns titles, URLs, descriptions | `BRAVE_API_KEY` |
+| `search_images(query)` | Brave image search — returns image URLs and thumbnails | `BRAVE_API_KEY` |
 | `get_weather(location, units?)` | Current conditions from OpenWeatherMap | `OPENWEATHERMAP_API_KEY` |
 | `fetch_page(url)` | Fetch and extract readable text from a web page; blocks private addresses | — |
 | `calculate(expression)` | Safe AST-based arithmetic evaluator | — |
@@ -282,17 +326,25 @@ All users in a room share the same conversation history. The agent sees messages
 | `save_memory(key, value, category?, ttl_days?)` | Persist a fact to `memory.json`; optional TTL auto-expires it | — |
 | `recall_memory(query?)` | Semantic + keyword search over stored memories | `EMBEDDING_MODEL` (optional) |
 | `delete_memory(key)` | Remove a stored memory by key | — |
+| `run_python(code, timeout?)` | Execute Python in a sandboxed subprocess; workspace-only file I/O, subprocess blocked | — |
 | `start_background_task(task, delay_seconds?)` | Run a task asynchronously; delivers result to user when done | — |
 | `list_files(path?)` | List files and directories in the workspace | — |
 | `find_files(pattern)` | Glob search in the workspace, e.g. `**/*.md` | — |
-| `read_file(path)` | Read a text file from the workspace (100 KB limit) | — |
+| `read_file(path, start_line?, end_line?)` | Read a text file from the workspace (100 KB limit; range supported) | — |
 | `write_file(path, content)` | Write or overwrite a file in the workspace | — |
+| `append_file(path, content)` | Append text to a workspace file without overwriting | — |
+| `patch_file(path, start_line, end_line, content)` | Replace a line range in a workspace file | — |
 | `download_file(url, path)` | Download a file from a URL into the workspace (50 MB limit) | — |
+| `search_files(query, path?, case_sensitive?)` | Keyword search across workspace files with line snippets | — |
+| `search_files_semantic(query, path?)` | Semantic search across workspace files using vector similarity | `EMBEDDING_MODEL` |
 | `share_file(path)` | Deliver a workspace file to the user via the appropriate channel | — |
 | `get_calendar_events(days_ahead?, calendars?)` | Upcoming events from configured ICS calendars | `CALENDAR_*` |
 | `set_reminder(when, message)` | Schedule a reminder for a specific ISO 8601 datetime | — |
 | `list_reminders()` | Show all pending reminders with IDs and times | — |
 | `cancel_reminder(reminder_id)` | Cancel a pending reminder by ID | — |
+| `watch_url(url, interval_minutes?, label?)` | Monitor a URL for content changes; notify when it changes | — |
+| `unwatch_url(watch_id)` | Stop monitoring a URL by watch ID | — |
+| `list_watches()` | Show all active URL watches with intervals and last-check times | — |
 
 ### Memory categories
 
@@ -308,6 +360,10 @@ All users in a room share the same conversation history. The agent sees messages
 ### Semantic memory
 
 `recall_memory` computes cosine similarity between the query embedding and stored memory embeddings (using `nomic-embed-text` via Ollama). Entries with similarity ≥ 0.35 are returned. If embeddings are unavailable, it falls back to keyword matching.
+
+### Semantic workspace search
+
+`search_files_semantic` builds a vector index of workspace files on demand (stored in `WORKSPACE_INDEX_FILE`). Files are split into 400-character overlapping chunks, each embedded and cached with the file's modification time. Stale chunks are re-embedded the next time the tool is called. Use this for concept and topic queries; use `search_files` for exact keyword matches.
 
 ### Web page fetching safety
 
@@ -376,7 +432,10 @@ All generated runtime files are kept under `data/` and gitignored as a single en
 | `data/agent_history.jsonl` | Structured JSONL event log (inputs, tool calls, outputs, errors) |
 | `data/memory.json` | Persistent agent memory store |
 | `data/reminders.json` | Pending reminders (rescheduled on restart) |
+| `data/watches.json` | Active URL watches (rescheduled on restart) |
+| `data/history/` | Per-session conversation history (one JSON file per Matrix room / HTTP session) |
+| `data/workspace_index.json` | Vector index for semantic workspace search |
 | `data/nio_store/` | Matrix E2EE session keys |
-| `data/workspace/` | Sandboxed workspace for file tools |
+| `data/workspace/` | Sandboxed workspace for file tools and code execution |
 
-Override individual paths via their respective env vars (`AGENT_LOG_FILE`, `MEMORY_FILE`, `REMINDERS_FILE`, `MATRIX_STORE_PATH`, `WORKSPACE_DIR`).
+Override individual paths via their respective env vars (`AGENT_LOG_FILE`, `MEMORY_FILE`, `REMINDERS_FILE`, `WATCHES_FILE`, `HISTORY_DIR`, `WORKSPACE_INDEX_FILE`, `MATRIX_STORE_PATH`, `WORKSPACE_DIR`).

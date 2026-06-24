@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+import app.history as _history
 from app.triggers.base import BaseTrigger, TriggerEvent
 
 HTTP_API_KEY = os.getenv("HTTP_API_KEY", "")
@@ -31,7 +32,7 @@ class HTTPTrigger(BaseTrigger):
         self.port = port
         self._server = None
         self._uvicorn: uvicorn.Server | None = None
-        self._sessions: dict[str, list[dict]] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self.app = self._build_app()
 
     def _build_app(self) -> FastAPI:
@@ -51,11 +52,9 @@ class HTTPTrigger(BaseTrigger):
 
         @app.post("/api/v1/run", dependencies=[Depends(_verify_auth)])
         async def run(req: RunRequest):
-            history = (
-                self._sessions.setdefault(req.session_id, [])
-                if req.session_id
-                else []
-            )
+            session_id = req.session_id
+            history = _history.load(session_id) if session_id else []
+            lock = self._session_locks.setdefault(session_id, asyncio.Lock()) if session_id else None
             queue: asyncio.Queue = asyncio.Queue()
 
             async def respond_fn(text: str) -> None:
@@ -85,12 +84,21 @@ class HTTPTrigger(BaseTrigger):
             )
 
             async def run_agent() -> None:
-                try:
-                    await self._server.handle_event(event)
-                except Exception as e:
-                    await queue.put({"type": "error", "text": str(e)})
-                finally:
-                    await queue.put(None)
+                async def _run() -> None:
+                    try:
+                        await self._server.handle_event(event)
+                        if session_id:
+                            _history.save(session_id, event.history)
+                    except Exception as e:
+                        await queue.put({"type": "error", "text": str(e)})
+                    finally:
+                        await queue.put(None)
+
+                if lock:
+                    async with lock:
+                        await _run()
+                else:
+                    await _run()
 
             async def generate():
                 task = asyncio.create_task(run_agent())
