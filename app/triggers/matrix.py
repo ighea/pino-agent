@@ -318,7 +318,6 @@ class MatrixTrigger(BaseTrigger):
                 )
 
         async def status_fn(message: str) -> None:
-            await self._client.room_typing(captured_room_id, typing_state=True, timeout=30000)
             if not message:
                 return
             try:
@@ -382,8 +381,19 @@ class MatrixTrigger(BaseTrigger):
             deliver_fn=deliver_fn,
         )
 
+        async def _typing_keepalive() -> None:
+            try:
+                while True:
+                    await self._client.room_typing(captured_room_id, typing_state=True, timeout=30000)
+                    await asyncio.sleep(25)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"[matrix] typing keepalive error: {e}")
+
         async def run_with_lock() -> None:
             async with lock:
+                typing_task = asyncio.create_task(_typing_keepalive())
                 try:
                     await self._server.handle_event(trigger_event)
                     asyncio.create_task(react_fn("✅"))
@@ -391,6 +401,7 @@ class MatrixTrigger(BaseTrigger):
                     asyncio.create_task(react_fn("❌"))
                     raise
                 finally:
+                    typing_task.cancel()
                     await self._client.room_typing(captured_room_id, typing_state=False)
             logger.log_event("MATRIX_RESPONSE", {"room": captured_room_id, "sender": matrix_event.sender})
 

@@ -158,10 +158,28 @@ class TextToolCallingLLM(BaseLLM):
         tools: list[dict] | None = None,
         max_tokens: int | None = None,
     ) -> Any:
+        import json as _json
+        msg_chars = sum(
+            len(str(m.get("content") or "")) + len(str(m.get("tool_calls") or ""))
+            for m in messages
+        )
+        tool_chars = len(_json.dumps(tools)) if tools else 0
+        total_chars = msg_chars + tool_chars
+        logger.log_event("LLM_REQUEST", {
+            "model": self._inner.model,
+            "messages": len(messages),
+            "tools": len(tools) if tools else 0,
+            "msg_chars": msg_chars,
+            "tool_chars": tool_chars,
+            "total_chars": total_chars,
+            "total_tokens_est": total_chars // 4,
+        })
+
         raw = await self._inner.chat(messages, tools=tools, max_tokens=max_tokens)
 
         choice = raw.choices[0]
         msg = choice.message
+        usage = getattr(raw, "usage", None)
         logger.log_event("LLM_RAW_RESPONSE", {
             "model": self._inner.model,
             "finish_reason": choice.finish_reason,
@@ -169,6 +187,8 @@ class TextToolCallingLLM(BaseLLM):
             "tool_names": [tc.function.name for tc in msg.tool_calls] if msg.tool_calls else [],
             "content_length": len(msg.content or ""),
             "content_preview": (msg.content or "")[:200],
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
         })
 
         return _normalise(raw)
