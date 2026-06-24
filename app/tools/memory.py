@@ -1,46 +1,14 @@
 import datetime
 import json
-import math
 import os
 
-from openai import OpenAI as _OpenAI
-
+from app.embed import cosine as _cosine
+from app.embed import embed as _embed
 from app.tools.builtin import tool_manager
 
 MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 
 _UTC = datetime.timezone.utc
-_embed_client: _OpenAI | None = None
-
-
-def _get_embed_client() -> _OpenAI:
-    global _embed_client
-    if _embed_client is None:
-        _embed_client = _OpenAI(
-            base_url=os.getenv("OPENAI_BASE_URL", "http://host.docker.internal:11434/v1"),
-            api_key=os.getenv("OPENAI_API_KEY", "ollama"),
-        )
-    return _embed_client
-
-
-def _embed(text: str) -> list[float] | None:
-    if not EMBEDDING_MODEL:
-        return None
-    try:
-        resp = _get_embed_client().embeddings.create(model=EMBEDDING_MODEL, input=text)
-        return resp.data[0].embedding
-    except Exception:
-        return None
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 def _load() -> dict:

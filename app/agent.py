@@ -12,6 +12,7 @@ from app.tools.manager import ToolManager
 from app.summarizer import maybe_summarize
 from app.tools.background import set_background_context
 from app.tools.memory import get_core_memories
+from app.tools.monitor import set_monitor_context
 from app.tools.reactions import set_react_fn
 from app.tools.reminder import set_reminder_context
 from app.tools.share import set_deliver_fn
@@ -97,8 +98,8 @@ SYSTEM_PROMPT = (
     "Before asking the user for any information, always follow this resolution order: "
     "1. Check memory first — call recall_memory with a relevant query to find stored facts "
     "(home city, preferences, names, appointments, etc.). "
-    "2. Search workspace files — use search_files to look for relevant information in files "
-    "you have previously written or saved. "
+    "2. Search workspace files — use search_files for exact keyword matches and "
+    "search_files_semantic for concept or topic-based queries in files you have previously written or saved. "
     "3. Search the web — if memory and files lack the answer and the question is factual or current, "
     "use search_web and fetch_page to find up-to-date information. "
     "4. Only ask the user if none of the above resolves it. "
@@ -119,9 +120,9 @@ SYSTEM_PROMPT = (
     "For tasks that would take a long time or that the user doesn't need to wait for, "
     "use start_background_task — the result will be delivered to the user automatically when done. "
     "You have a sandboxed workspace for reading and writing files; use list_files to explore it, "
-    "search_files to find relevant content across files, read_file with start_line/end_line to read "
-    "specific sections, write_file to create or overwrite files, append_file to add to existing files, "
-    "and patch_file to replace specific lines without rewriting the whole file. "
+    "search_files to find exact text matches, search_files_semantic to find files by topic or concept, "
+    "read_file with start_line/end_line to read specific sections, write_file to create or overwrite files, "
+    "append_file to add to existing files, and patch_file to replace specific lines without rewriting the whole file. "
     "Use set_reminder to schedule reminders — calculate the target ISO 8601 datetime from the "
     "current date/time provided in this prompt."
 )
@@ -248,6 +249,7 @@ class AgentLoop:
         set_deliver_fn(event.deliver_fn)
         set_background_context(self.llm, self.tools, event.respond_fn)
         set_reminder_context(event.metadata.get("room_id"))
+        set_monitor_context(event.metadata.get("room_id"))
 
         if self.fast_llm and event.respond_fn and event.source not in ("scheduler", "background"):
             asyncio.create_task(self._quick_ack(event))

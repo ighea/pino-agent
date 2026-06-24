@@ -18,6 +18,9 @@ import app.tools.files       # registers list_files, find_files, read_file, writ
 import app.tools.share       # registers share_file onto tool_manager
 import app.tools.calendar    # registers get_calendar_events onto tool_manager
 import app.tools.reminder    # registers set_reminder, list_reminders, cancel_reminder onto tool_manager
+import app.workspace_index   # registers search_files_semantic onto tool_manager
+import app.tools.code        # registers run_python onto tool_manager
+import app.tools.monitor     # registers watch_url, unwatch_url, list_watches onto tool_manager
 from app.triggers.cli import CLITrigger
 from app.triggers.http import HTTPTrigger
 from app.triggers.matrix import MatrixTrigger
@@ -89,9 +92,10 @@ async def run(args: argparse.Namespace) -> None:
     if args.mode in ("matrix", "all"):
         server.register_trigger(MatrixTrigger())
 
-    # Start scheduler and restore pending reminders
+    # Start scheduler and restore pending reminders and watches
     _scheduler.start()
     app.tools.reminder.load_and_schedule_pending()
+    app.tools.monitor.load_and_schedule_pending()
 
     # Schedule daily briefing if configured
     if DAILY_BRIEFING_TIME:

@@ -8,7 +8,10 @@ pino/
 ├── app/
 │   ├── server.py                # CoreServer: trigger registry + event dispatch
 │   ├── agent.py                 # AgentLoop: LLM ↔ tool call orchestration + quick ack
-│   ├── summarizer.py            # Conversation summarization (compresses old history turns)
+│   ├── summarizer.py            # Conversation summarization (char-based, preserves tool-call chains)
+│   ├── history.py               # Per-session history persistence (load/save to data/history/)
+│   ├── embed.py                 # Shared embedding utilities (embed(), cosine()) — used by memory + workspace index
+│   ├── workspace_index.py       # On-demand vector index over workspace files + search_files_semantic tool
 │   ├── logger.py                # Structured JSONL logging → data/agent_history.jsonl
 │   ├── scheduler.py             # APScheduler singleton + proactive message handler registry
 │   ├── triggers/
@@ -21,21 +24,26 @@ pino/
 │   │   └── openai_provider.py   # OpenAI-compatible provider (Ollama by default)
 │   └── tools/
 │       ├── manager.py           # ToolManager: registry, schema generation, sync/async dispatch
-│       ├── builtin.py           # search_web, get_weather, calculate, get_datetime + shared tool_manager
-│       ├── memory.py            # save_memory, recall_memory, delete_memory (JSON + embeddings)
+│       ├── builtin.py           # search_web, search_images, get_weather, calculate, get_datetime + shared tool_manager
+│       ├── memory.py            # save_memory, recall_memory, delete_memory (JSON + embeddings via app.embed)
 │       ├── reactions.py         # react tool (ContextVar-based, async)
 │       ├── fetch.py             # fetch_page tool (SSRF-safe web page text extraction)
 │       ├── background.py        # start_background_task tool (asyncio tasks)
-│       ├── files.py             # list_files, find_files, read_file, write_file, download_file
+│       ├── files.py             # list_files, find_files, read_file, write_file, append_file, patch_file, download_file, search_files
 │       ├── share.py             # share_file tool (ContextVar-based, trigger-aware delivery)
 │       ├── calendar.py          # get_calendar_events (multi-calendar ICS, RRULE support)
-│       └── reminder.py          # set_reminder, list_reminders, cancel_reminder (APScheduler)
+│       ├── reminder.py          # set_reminder, list_reminders, cancel_reminder (APScheduler date jobs)
+│       ├── monitor.py           # watch_url, unwatch_url, list_watches (APScheduler interval jobs)
+│       └── code.py              # run_python (sandboxed subprocess execution, workspace-only I/O)
 ├── data/                        # Runtime data — gitignored; created automatically on first run
 │   ├── agent_history.jsonl      # Structured JSONL event log
 │   ├── memory.json              # Persistent memory store
 │   ├── reminders.json           # Pending reminders
+│   ├── watches.json             # Active URL watches
+│   ├── workspace_index.json     # Vector index for search_files_semantic
+│   ├── history/                 # Per-session conversation history files
 │   ├── nio_store/               # Matrix E2EE session keys
-│   └── workspace/               # Sandboxed file tool workspace
+│   └── workspace/               # Sandboxed file tool + code execution workspace
 ├── .env.example                 # Documents all env vars — copy to .env and fill in
 ├── .claudeignore                # Prevents Claude from reading .env and data/
 ├── requirements.txt
@@ -54,8 +62,8 @@ class TriggerEvent:
     input: str                                          # the user's message
     source: str                                         # "cli", "http", "matrix", "scheduler", …
     id: str                                             # auto-generated UUID
-    metadata: dict                                      # trigger-specific extras
-    history: list[dict]                                 # mutable conversation history (updated in-place)
+    metadata: dict                                      # trigger-specific extras (room_id, sender, …)
+    history: list[dict]                                 # mutable conversation history (updated in-place by AgentLoop)
     respond_fn:  Callable[[str], Awaitable[None]]       # called with the final answer (and quick ack)
     status_fn:   Callable[[str], Awaitable[None]]       # called during tool use
     react_fn:    Callable[[str], Awaitable[None]]       # called to attach an emoji reaction
@@ -68,25 +76,79 @@ All callbacks are optional (can be `None`). The agent never knows or cares which
 
 `app/agent.py` runs an iterative loop:
 
-1. If history is long, call `maybe_summarize()` to compress old turns.
-2. Set per-request ContextVars: `react_fn`, `deliver_fn`, background context, `reminder_room_id`.
+1. If history is large (by char count), call `maybe_summarize()` to compress old turns.
+2. Set per-request ContextVars: `react_fn`, `deliver_fn`, background context, `reminder_room_id`, `monitor_room_id`.
 3. If `fast_llm` is set and `respond_fn` is present, fire `_quick_ack()` as a concurrent asyncio task — it sends a short acknowledgment (with a topic emoji) before the main loop starts.
-4. Build `[system, …history, user]` message list. The system prompt includes the current UTC datetime so the LLM can calculate reminder times correctly.
+4. Build `[system, …history, user]` message list. The system prompt includes the current datetime (in `AGENT_TZ`) and core memories so the LLM always has essential context.
 5. Call the primary LLM with all registered tool schemas (with exponential-backoff retry).
 6. If the response contains `tool_calls`: emit a status message, execute all tools concurrently via `asyncio.gather`, append `tool` messages, loop.
 7. If the response is plain text: call `event.respond_fn(text)` and return. Empty responses are retried up to 2 times before returning a user-facing error.
+8. If `finish_reason == "length"` (context overflow): strip history, keep only `[system, user, …tool_chain]`, retry once.
+
+At the end of a successful turn `event.history` is updated in-place with all messages from this turn (minus the system prompt). The caller (trigger) then persists this to disk.
 
 Maximum steps default is 10. Tool errors are surfaced immediately via `status_fn`.
 
 ### ContextVar isolation
 
-Per-request state (`react_fn`, `deliver_fn`, `llm`, `tools`, `push_fn` for background tasks, `reminder_room_id`) is stored in `contextvars.ContextVar`. Each asyncio task inherits a copy of the context at creation time, so concurrent requests from different rooms or HTTP sessions cannot interfere with each other.
+Per-request state (`react_fn`, `deliver_fn`, `llm`, `tools`, `push_fn` for background tasks, `reminder_room_id`, `monitor_room_id`) is stored in `contextvars.ContextVar`. Each asyncio task inherits a copy of the context at creation time, so concurrent requests from different rooms or HTTP sessions cannot interfere with each other.
+
+### Conversation history persistence
+
+`app/history.py` provides two functions:
+
+- `load(session_id) -> list[dict]` — reads `data/history/<safe_id>.json`; returns `[]` if missing
+- `save(session_id, history)` — writes up to `MAX_PERSISTED_HISTORY` (default 200) messages
+
+Session IDs are sanitized (non-alphanumeric chars replaced with `_`) before use as filenames. Matrix triggers use `room_id` as the session ID; HTTP triggers use the caller-supplied `session_id`.
+
+Triggers load history from disk at the start of each event and save it after `handle_event` returns. The per-room lock in `MatrixTrigger` and the per-session lock in `HTTPTrigger` ensure only one request per session modifies history at a time.
+
+### Conversation summarization
+
+`app/summarizer.py` exports `maybe_summarize(history, llm)`. Triggered when `sum(chars) > MAX_HISTORY_CHARS` (default 12 000). The split point is found by scanning from the end until `SUMMARY_KEEP_CHARS` (default 4 000) chars are accumulated, then snapping forward to the next **user message** boundary — this ensures tool-call chains (assistant + one-or-more tool result messages) are never split. Tool call names and brief result snippets are included in the summarization prompt for better context retention.
+
+### Embedding utilities
+
+`app/embed.py` provides `embed(text) -> list[float] | None` and `cosine(a, b) -> float`. Both `app/tools/memory.py` and `app/workspace_index.py` import from this shared module. The embedding client is a lazy singleton pointing at `OPENAI_BASE_URL` with model `EMBEDDING_MODEL`.
+
+### Workspace semantic index
+
+`app/workspace_index.py` maintains a JSON vector index at `WORKSPACE_INDEX_FILE`. When `search_files_semantic` is called:
+
+1. All workspace files under the target path are scanned (max 50 files, max 50 KB per file).
+2. Files with a stale or missing mtime in the index are re-chunked (400-char chunks, 80-char overlap, max 20 chunks per file) and re-embedded.
+3. The updated index is saved to disk.
+4. The query is embedded and cosine similarity is computed against all stored chunks.
+5. Top-5 chunks with score ≥ 0.35 are returned with file path, relevance score, and a 300-char snippet.
+
+### Code execution sandbox
+
+`app/tools/code.py` implements `run_python(code, timeout)`. Before execution, a preamble is prepended to the user's code that:
+
+- Overrides `builtins.open` with a path-checking wrapper — `realpath` is used so symlinks can't escape; both the exact workspace path and paths under it are allowed
+- Replaces `subprocess.run/Popen/call/…` and `os.system/popen/execv/…` with a `PermissionError`-raising stub
+- Wraps everything in a function to avoid polluting the user's global namespace
+
+The subprocess runs with `cwd=WORKSPACE_DIR`, a minimal environment (`PATH`, `PYTHONIOENCODING`, `HOME=WORKSPACE_DIR`), and optionally `RLIMIT_CPU` via the `resource` module (Linux only). Output is capped at `CODE_MAX_OUTPUT_CHARS`.
 
 ### Proactive messages (scheduler)
 
 `app/scheduler.py` holds a singleton `AsyncIOScheduler` and a list of registered proactive handlers. Any component that can send unsolicited messages (e.g. `MatrixTrigger`) registers an async `(room_id: str | None, text: str) -> None` handler at startup. Callers use `fire_proactive(room_id, text)` — `room_id=None` broadcasts to all configured rooms.
 
-The scheduler is started in `main.py` before triggers and stopped in the `finally` block. Reminders are persisted to `REMINDERS_FILE` (default: `data/reminders.json`) and rescheduled on startup via `load_and_schedule_pending()`.
+The scheduler is started in `main.py` before triggers and stopped in the `finally` block. On startup, both `app.tools.reminder.load_and_schedule_pending()` and `app.tools.monitor.load_and_schedule_pending()` restore persisted jobs.
+
+### URL monitoring
+
+`app/tools/monitor.py` stores watches in `WATCHES_FILE` (default: `data/watches.json`). Each watch entry records the URL, interval, room_id, and last content hash. APScheduler `interval` jobs call `_check_watch(watch_id)` which:
+
+1. Fetches the URL (SSRF-protected via `_check_url`)
+2. Extracts text (Trafilatura for HTML; raw bytes otherwise)
+3. SHA-256 hashes the content
+4. If the hash differs from the stored baseline, calls `fire_proactive(room_id, notification)` and updates the stored hash
+5. First successful fetch only stores the baseline — no notification
+
+The `monitor_room_id` ContextVar is set in `AgentLoop.run()` alongside `reminder_room_id`, so watches created from a Matrix room are automatically associated with that room.
 
 ### ToolManager
 
@@ -100,10 +162,6 @@ The scheduler is started in `main.py` before triggers and stopped in the `finall
 - `get_status(name, args)` — formats the status message from the template
 
 The shared `tool_manager` instance lives in `app/tools/builtin.py` and is imported by all tool modules.
-
-### Conversation summarization
-
-`app/summarizer.py` exports `maybe_summarize(history, llm)`. When `len(history) > MAX_HISTORY_TURNS`, it summarizes all but the most recent `SUMMARY_KEEP_RECENT` turns into a single `system` message using the primary LLM. Called at the start of each `AgentLoop.run()`.
 
 ### Workspace file tools
 
@@ -125,14 +183,27 @@ All file tools operate inside `WORKSPACE_DIR` (default: `data/workspace`). `_saf
 | `OPENAI_API_KEY` | `ollama` | API key |
 | `OPENAI_MODEL` | `gemma4:e4b` | Primary model name |
 | `FAST_MODEL` | `qwen2.5:1.5b` | Quick-ack model; set empty to disable |
-| `BRAVE_API_KEY` | — | Brave Search (required for web search) |
+| `LLM_TEXT_TOOL_CALLING` | `1` | Wrap LLM in TextToolCallingLLM for models that don't support native tool calls |
+| `BRAVE_API_KEY` | — | Brave Search (required for web and image search) |
 | `OPENWEATHERMAP_API_KEY` | — | OpenWeatherMap (required for weather) |
 | `AGENT_LOG_FILE` | `data/agent_history.jsonl` | Structured event log path |
+| `AGENT_TZ` | `UTC` | IANA timezone for current-time in prompts and naive reminder datetimes |
+| `AGENT_PERSONA` | — | Optional persona string appended to the system prompt |
 | `MEMORY_FILE` | `data/memory.json` | Persistent memory store path |
-| `EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model for semantic memory |
-| `MAX_HISTORY_TURNS` | `20` | Summarize when history exceeds this |
-| `SUMMARY_KEEP_RECENT` | `6` | Verbatim turns kept after summarization |
-| `WORKSPACE_DIR` | `data/workspace` | Sandboxed directory for file tools |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model for semantic memory and workspace search |
+| `WORKSPACE_DIR` | `data/workspace` | Sandboxed directory for file tools and code execution |
+| `WORKSPACE_INDEX_FILE` | `data/workspace_index.json` | Vector index for `search_files_semantic` |
+| `HISTORY_DIR` | `data/history` | Directory for per-session history files |
+| `MAX_PERSISTED_HISTORY` | `200` | Maximum messages kept per session history file |
+| `WATCHES_FILE` | `data/watches.json` | Persistent URL watch store |
+| `REMINDERS_FILE` | `data/reminders.json` | Persistent reminder store path |
+| `OLLAMA_NUM_CTX` | `8192` | Context window size passed to Ollama |
+| `MAX_TOOL_RESULT_CHARS` | `3000` | Truncate individual tool results to this length |
+| `MAX_MESSAGES_CHARS` | auto | Character budget for messages list |
+| `MAX_HISTORY_CHARS` | `12000` | Trigger summarization at this total history char count |
+| `SUMMARY_KEEP_CHARS` | `4000` | Target chars of recent history to keep verbatim after summarizing |
+| `CODE_EXEC_TIMEOUT` | `30` | Default `run_python` timeout in seconds (hard cap: 120) |
+| `CODE_MAX_OUTPUT_CHARS` | `3000` | Truncate `run_python` output to this length |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
 | `HTTP_PORT` | `8000` | HTTP trigger port |
 | `HTTP_API_KEY` | — | Bearer token for HTTP auth; unset = open |
@@ -144,7 +215,6 @@ All file tools operate inside `WORKSPACE_DIR` (default: `data/workspace`). `_saf
 | `MATRIX_STORE_PATH` | `./data/nio_store` | E2EE key storage path |
 | `MATRIX_MAX_MSG_LEN` | `4000` | Split Matrix messages at this character count |
 | `CALENDAR_<name>` | — | ICS URL for a named calendar (e.g. `CALENDAR_WORK=…`) |
-| `REMINDERS_FILE` | `data/reminders.json` | Persistent reminder store path |
 | `DAILY_BRIEFING_TIME` | — | `HH:MM` to fire the daily briefing (unset = disabled) |
 | `DAILY_BRIEFING_TZ` | `UTC` | Timezone for `DAILY_BRIEFING_TIME` (e.g. `Europe/Helsinki`) |
 | `DAILY_BRIEFING_PROMPT` | see .env.example | Agent prompt for the daily briefing |
@@ -190,10 +260,12 @@ tool_manager.register(
 
 Async tools are awaited directly in the agent loop. Sync tools run in `asyncio.run_in_executor`. For tools that need per-request state (e.g. a callback from `TriggerEvent`), use `contextvars.ContextVar` and set it in `AgentLoop.run()`.
 
+For tools that use APScheduler (reminders, URL watches): call `load_and_schedule_pending()` from `main.py` after `_scheduler.start()` to restore persisted jobs on restart.
+
 ### Add a trigger
 
 1. Subclass `BaseTrigger` from `app/triggers/base.py`.
-1. Implement `async def start(self, server: CoreServer)` — produce `TriggerEvent` objects and pass them to `await server.handle_event(event)`.
+1. Implement `async def start(self, server: CoreServer)` — load history with `history.load(session_id)`, produce `TriggerEvent` objects, pass them to `await server.handle_event(event)`, then save history with `history.save(session_id, event.history)`.
 1. Implement `async def stop(self)`.
 1. Register it in `main.py`: `server.register_trigger(MyTrigger(…))`.
 
@@ -201,8 +273,9 @@ Provide all four callbacks (`respond_fn`, `status_fn`, `react_fn`, `deliver_fn`)
 
 ## Conventions
 
-- **No code execution in tools**: the calculator uses `ast` parsing with an explicit allowlist — never use `eval()`.
-- **SSRF guard on all outbound requests**: import `_check_url` from `app/tools/fetch.py` and call it before any HTTP request to a user-supplied URL.
+- **SSRF guard on all outbound requests**: import `_check_url` from `app/tools/fetch.py` and call it before any HTTP request to a user-supplied URL. This blocks private, loopback, link-local, and reserved IP ranges.
+- **Sandbox preamble for code execution**: use `app/tools/code.py`'s preamble pattern — override `builtins.open` inside a helper function so intermediate variables don't leak into the user's namespace; use `realpath` + prefix check (with trailing `os.sep`) to block path-confusion attacks.
+- **No `eval()` in tools**: the calculator uses `ast` parsing with an explicit allowlist.
 - **API keys never in error messages**: catch HTTP error codes explicitly; return plain string error messages.
 - **All async**: triggers, agent loop, tool dispatch (sync tools run in `run_in_executor`).
 - **No comments explaining what code does** — only for non-obvious constraints, invariants, or workarounds.

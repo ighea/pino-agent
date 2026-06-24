@@ -18,6 +18,7 @@ from nio import (
     UploadError,
 )
 
+import app.history as _history
 from app.logger import logger
 from app.triggers.base import BaseTrigger, TriggerEvent
 
@@ -92,7 +93,6 @@ class MatrixTrigger(BaseTrigger):
     def __init__(self) -> None:
         self._server = None
         self._client: AsyncClient | None = None
-        self._room_histories: dict[str, list[dict]] = {}
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._mention_prefixes: list[str] = []
         self._start_ms: int = 0
@@ -282,7 +282,6 @@ class MatrixTrigger(BaseTrigger):
         """Build trigger callbacks and dispatch a TriggerEvent for a room message."""
         captured_event_id = matrix_event.event_id
         captured_room_id = room.room_id
-        history = self._room_histories.setdefault(captured_room_id, [])
         lock = self._room_locks.setdefault(captured_room_id, asyncio.Lock())
 
         async def react_fn(emoji: str) -> None:
@@ -374,7 +373,7 @@ class MatrixTrigger(BaseTrigger):
             input=input_content,
             source="matrix",
             metadata={"room_id": captured_room_id, "sender": matrix_event.sender},
-            history=history,
+            history=_history.load(captured_room_id),
             respond_fn=respond_fn,
             status_fn=status_fn,
             react_fn=react_fn,
@@ -396,6 +395,7 @@ class MatrixTrigger(BaseTrigger):
                 typing_task = asyncio.create_task(_typing_keepalive())
                 try:
                     await self._server.handle_event(trigger_event)
+                    _history.save(captured_room_id, trigger_event.history)
                     asyncio.create_task(react_fn("✅"))
                 except Exception:
                     asyncio.create_task(react_fn("❌"))
