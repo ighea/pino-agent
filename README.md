@@ -37,15 +37,19 @@ pip install -r requirements.txt
 | --- | --- | --- |
 | `OPENAI_BASE_URL` | `http://host.docker.internal:11434/v1` | LLM endpoint (Ollama or any OpenAI-compatible API) |
 | `OPENAI_API_KEY` | `ollama` | API key (`ollama` for local Ollama) |
-| `OPENAI_MODEL` | `gemma4:latest` | Primary model name |
+| `OPENAI_MODEL` | `gemma4:e4b` | Primary model name |
 | `FAST_MODEL` | `qwen2.5:1.5b` | Quick-acknowledgment model; set empty to disable |
 | `BRAVE_API_KEY` | — | Brave Search API key (required for `search_web`) |
 | `OPENWEATHERMAP_API_KEY` | — | OpenWeatherMap API key (required for `get_weather`) |
-| `MEMORY_FILE` | `memory.json` | Path to persistent memory store |
+| `AGENT_LOG_FILE` | `data/agent_history.jsonl` | Structured event log path |
+| `MEMORY_FILE` | `data/memory.json` | Path to persistent memory store |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model for semantic memory embeddings |
+| `OLLAMA_NUM_CTX` | `8192` | Context window tokens passed to Ollama per request (Ollama default of 2048 is too small for tool use) |
+| `MAX_TOOL_RESULT_CHARS` | `3000` | Truncate individual tool results to this length before adding to the message list |
+| `MAX_MESSAGES_CHARS` | auto | Character budget for the messages list; defaults to `OLLAMA_NUM_CTX × 4 − 16000` |
 | `MAX_HISTORY_TURNS` | `20` | Summarize conversation when history exceeds this many turns |
 | `SUMMARY_KEEP_RECENT` | `6` | Keep this many recent turns verbatim after summarization |
-| `WORKSPACE_DIR` | `<project_root>/workspace` | Sandboxed directory for file tools |
+| `WORKSPACE_DIR` | `data/workspace` | Sandboxed directory for file tools |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
 | `HTTP_PORT` | `8000` | HTTP trigger port |
 | `HTTP_API_KEY` | — | Bearer token for HTTP auth; unset = open |
@@ -54,10 +58,10 @@ pip install -r requirements.txt
 | `MATRIX_USER` | — | Bot Matrix ID, e.g. `@pino:matrix.org` |
 | `MATRIX_PASSWORD` | — | Bot account password |
 | `MATRIX_ROOM_IDS` | — | Comma-separated list of room IDs to join |
-| `MATRIX_STORE_PATH` | `./nio_store` | Path for E2EE key storage |
+| `MATRIX_STORE_PATH` | `./data/nio_store` | Path for E2EE key storage |
 | `MATRIX_MAX_MSG_LEN` | `4000` | Split Matrix messages at this character count |
 | `CALENDAR_<name>` | — | ICS URL for a named calendar, e.g. `CALENDAR_WORK=https://…` |
-| `REMINDERS_FILE` | `reminders.json` | Persistent reminder store path |
+| `REMINDERS_FILE` | `data/reminders.json` | Persistent reminder store path |
 | `DAILY_BRIEFING_TIME` | — | `HH:MM` to send the daily briefing (unset = disabled) |
 | `DAILY_BRIEFING_TZ` | `UTC` | Timezone for `DAILY_BRIEFING_TIME`, e.g. `Europe/Helsinki` |
 | `DAILY_BRIEFING_PROMPT` | see .env.example | Agent prompt used to generate the daily briefing |
@@ -363,6 +367,16 @@ docker compose up --build
 
 The compose file passes `.env` variables through to the container. The default mode is `all` (CLI + HTTP + Matrix).
 
-## Logs
+## Data directory
 
-All agent events are written to `agent_history.jsonl` in JSONL format: inputs, tool calls, tool responses, and final outputs. The file is gitignored.
+All generated runtime files are kept under `data/` and gitignored as a single entry:
+
+| Path | Contents |
+| --- | --- |
+| `data/agent_history.jsonl` | Structured JSONL event log (inputs, tool calls, outputs, errors) |
+| `data/memory.json` | Persistent agent memory store |
+| `data/reminders.json` | Pending reminders (rescheduled on restart) |
+| `data/nio_store/` | Matrix E2EE session keys |
+| `data/workspace/` | Sandboxed workspace for file tools |
+
+Override individual paths via their respective env vars (`AGENT_LOG_FILE`, `MEMORY_FILE`, `REMINDERS_FILE`, `MATRIX_STORE_PATH`, `WORKSPACE_DIR`).

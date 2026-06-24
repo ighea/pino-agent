@@ -316,10 +316,19 @@ class MatrixTrigger(BaseTrigger):
                         "formatted_body": _md.markdown(chunk),
                     },
                 )
-            await self._client.room_typing(captured_room_id, typing_state=False)
 
-        async def status_fn(_: str) -> None:
+        async def status_fn(message: str) -> None:
             await self._client.room_typing(captured_room_id, typing_state=True, timeout=30000)
+            if not message:
+                return
+            try:
+                await self._client.room_send(
+                    room_id=captured_room_id,
+                    message_type="m.room.message",
+                    content={"msgtype": "m.notice", "body": message},
+                )
+            except Exception as e:
+                print(f"[matrix] status message failed: {e}")
 
         async def deliver_fn(path: str) -> str:
             from app.tools.files import _safe_path
@@ -381,6 +390,8 @@ class MatrixTrigger(BaseTrigger):
                 except Exception:
                     asyncio.create_task(react_fn("❌"))
                     raise
+                finally:
+                    await self._client.room_typing(captured_room_id, typing_state=False)
             logger.log_event("MATRIX_RESPONSE", {"room": captured_room_id, "sender": matrix_event.sender})
 
         asyncio.create_task(react_fn("👀"))

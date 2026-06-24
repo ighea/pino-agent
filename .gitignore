@@ -1,8 +1,4 @@
 .aider*
 __pycache__
 .env
-agent_history.jsonl
-memory.json
-reminders.json
-nio_store/
-workspace/
+data/

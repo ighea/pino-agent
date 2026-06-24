@@ -149,10 +149,14 @@ tool_manager.register(
     name="save_memory",
     fn=_save_memory,
     description=(
-        "Save an important piece of information to long-term memory. "
-        "Use for locations, preferences, appointments, names, or any personal detail worth remembering across conversations. "
-        "Choose a short descriptive key and an optional category. "
-        "For time-sensitive information such as appointments or reminders, set ttl_days so the memory expires automatically."
+        "Save a piece of information to long-term memory for future conversations. "
+        "Use liberally — save not only what the user states directly (name, city, preferences, appointments) "
+        "but also facts inferred from context (city implied by a weather question, language from writing style, "
+        "interests from repeated topics, corrections the user makes). "
+        "When uncertain whether something is worth saving, save it: memories can be deleted, "
+        "but a forgotten detail means asking the user again. "
+        "Choose a short descriptive key and an appropriate category. "
+        "For time-sensitive information set ttl_days so the memory expires automatically."
     ),
     parameters={
         "type": "object",
