@@ -37,13 +37,15 @@ pino/
 │       ├── scheduled_tasks.py   # create_scheduled_task, list_scheduled_tasks, cancel_scheduled_task (APScheduler interval/cron jobs)
 │       ├── subagent.py          # delegate_task (inline sub-agent with depth limit, parallel-friendly)
 │       ├── tasks.py             # plan_steps, finish_step (ephemeral per-turn task tracking)
-│       └── code.py              # run_python (sandboxed subprocess execution, workspace-only I/O)
+│       ├── code.py              # run_python (sandboxed subprocess execution, workspace-only I/O)
+│       └── memory_consolidation.py  # consolidate_memories + scheduled job: learn from history, compact core memories
 ├── data/                        # Runtime data — gitignored; created automatically on first run
 │   ├── agent_history.jsonl      # Structured JSONL event log
 │   ├── memory.json              # Persistent memory store
 │   ├── reminders.json           # Pending reminders
 │   ├── watches.json             # Active URL watches
 │   ├── scheduled_tasks.json     # Recurring scheduled task store
+│   ├── memory_consolidation_state.json  # Last-run timestamp for incremental consolidation scans
 │   ├── workspace_index.json     # Vector index for search_files_semantic
 │   ├── history/                 # Per-session conversation history files
 │   ├── nio_store/               # Matrix E2EE session keys
@@ -166,6 +168,19 @@ When a scheduled task fires:
 2. A `TriggerEvent` is created with `source="scheduler"` and a `respond_fn` that calls `fire_proactive(room_id, ...)`.
 3. `server.handle_event(event)` runs the full agent loop; the final result is delivered proactively.
 
+### Memory consolidation
+
+`app/tools/memory_consolidation.py` provides a scheduled job and an on-demand `consolidate_memories` tool. On each run:
+
+1. **History scan** — reads `data/history/*.json` files whose `mtime` is newer than the `last_run` timestamp stored in `MEMORY_CONSOLIDATION_STATE_FILE`. Extracts up to `MEMORY_CONSOLIDATION_MAX_HISTORY_CHARS` of user/assistant text (last 40 messages per file, newest sessions first). Tool result messages are excluded.
+2. **Prompt construction** — embeds the excerpts in a self-contained prompt together with current core memory count and compaction instructions. `last_run` is written to the state file **before** the agent runs so that a partial failure doesn't cause the same messages to be reprocessed.
+3. **Agent run** — fires `server.handle_event()` with `source="scheduler"`, giving the agent full access to `save_memory`, `recall_memory`, and `delete_memory`. The agent extracts learnings and calls `save_memory` for each, then reviews all memories for redundancy/staleness and calls `delete_memory` on any duplicates or outdated entries.
+4. **Core compaction** — when core memory count ≥ `MEMORY_CONSOLIDATION_CORE_THRESHOLD` (default 8), the prompt instructs the agent to merge entries, demote non-universal facts to `preference` or `personal`, and re-save consolidated versions.
+
+Scheduling mirrors the daily briefing: `setup_consolidation_schedule(server)` registers either a cron or interval APScheduler job. An on-demand `consolidate_memories` tool is also registered so the agent (or user) can trigger a run at any time.
+
+`set_consolidation_server(server)` — called by `main.py` at startup — stores the server reference so the tool can invoke the agent loop.
+
 ### Background task notifications
 
 `app/tools/background.py` now stores the `room_id` alongside the LLM, tools, and push_fn in ContextVars. When a background task completes it first tries `push_fn` (the `respond_fn` from the original request); if that fails or is absent it falls back to `fire_proactive(room_id, ...)`. The room_id is also injected into the background `TriggerEvent`'s metadata so reminders and watches set within the background task are associated with the correct room.
@@ -253,6 +268,11 @@ All file tools operate inside `WORKSPACE_DIR` (default: `data/workspace`). `_saf
 | `DAILY_BRIEFING_TIME` | — | `HH:MM` to fire the daily briefing (unset = disabled) |
 | `DAILY_BRIEFING_TZ` | `UTC` | Timezone for `DAILY_BRIEFING_TIME` (e.g. `Europe/Helsinki`) |
 | `DAILY_BRIEFING_PROMPT` | see .env.example | Agent prompt for the daily briefing |
+| `MEMORY_CONSOLIDATION_CRON` | — | 5-field cron for memory consolidation (e.g. `0 3 * * *`); unset = disabled |
+| `MEMORY_CONSOLIDATION_INTERVAL_HOURS` | — | Alternative: run consolidation every N hours |
+| `MEMORY_CONSOLIDATION_CORE_THRESHOLD` | `8` | Compact core memories when count reaches this number |
+| `MEMORY_CONSOLIDATION_STATE_FILE` | `data/memory_consolidation_state.json` | Tracks last-run timestamp for incremental history scans |
+| `MEMORY_CONSOLIDATION_MAX_HISTORY_CHARS` | `8000` | Max chars of conversation history embedded in each consolidation prompt |
 
 ## Running
 

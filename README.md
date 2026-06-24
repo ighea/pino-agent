@@ -74,6 +74,11 @@ pip install -r requirements.txt
 | `DAILY_BRIEFING_TIME` | — | `HH:MM` to send the daily briefing (unset = disabled) |
 | `DAILY_BRIEFING_TZ` | `UTC` | Timezone for `DAILY_BRIEFING_TIME`, e.g. `Europe/Helsinki` |
 | `DAILY_BRIEFING_PROMPT` | see .env.example | Agent prompt used to generate the daily briefing |
+| `MEMORY_CONSOLIDATION_CRON` | — | 5-field cron for memory consolidation (e.g. `0 3 * * *`); unset = disabled |
+| `MEMORY_CONSOLIDATION_INTERVAL_HOURS` | — | Alternative to cron: run consolidation every N hours |
+| `MEMORY_CONSOLIDATION_CORE_THRESHOLD` | `8` | Compact core memories when count reaches this number |
+| `MEMORY_CONSOLIDATION_STATE_FILE` | `data/memory_consolidation_state.json` | Tracks last-run timestamp for incremental history scans |
+| `MEMORY_CONSOLIDATION_MAX_HISTORY_CHARS` | `8000` | Maximum characters of conversation history embedded in each consolidation prompt |
 
 ## Running
 
@@ -269,6 +274,24 @@ DAILY_BRIEFING_TZ=Europe/Helsinki
 
 The briefing runs the full agent loop — it can check the calendar, weather, or anything else — and sends the result proactively without any user message. The prompt is configurable via `DAILY_BRIEFING_PROMPT`.
 
+## Memory consolidation
+
+Set `MEMORY_CONSOLIDATION_CRON` (or `MEMORY_CONSOLIDATION_INTERVAL_HOURS`) to have Pino periodically scan recent conversations, extract learnable facts into memory, and clean up redundant or stale entries:
+
+```bash
+MEMORY_CONSOLIDATION_CRON=0 3 * * *   # nightly at 03:00
+MEMORY_CONSOLIDATION_CORE_THRESHOLD=8  # compact core memories when count >= 8
+```
+
+On each run the agent:
+
+1. **Learns from history** — reads conversation history files modified since the last run (up to `MEMORY_CONSOLIDATION_MAX_HISTORY_CHARS` of text) and calls `save_memory` for any facts, preferences, interests, or inferred context worth keeping
+2. **Compacts core memories** — when core memory count reaches `MEMORY_CONSOLIDATION_CORE_THRESHOLD`, uses `recall_memory` + `delete_memory` + `save_memory` to merge redundant entries, remove stale ones, and re-save consolidated versions; also does a quick staleness pass on all other categories
+
+Progress is tracked in `MEMORY_CONSOLIDATION_STATE_FILE` (default: `data/memory_consolidation_state.json`) so each run only processes conversations that occurred since the previous run.
+
+You can also trigger consolidation on demand — just ask the agent to "consolidate memories" and it will call the `consolidate_memories` tool immediately.
+
 ## HTTP API
 
 ### POST `/api/v1/run`
@@ -410,6 +433,7 @@ All users in a room share the same conversation history. The agent sees messages
 | `watch_url(url, interval_minutes?, label?)` | Monitor a URL for content changes; notify when it changes | — |
 | `unwatch_url(watch_id)` | Stop monitoring a URL by watch ID | — |
 | `list_watches()` | Show all active URL watches with intervals and last-check times | — |
+| `consolidate_memories()` | Immediately run a memory consolidation: extract learnings from recent history and compact core memories | — |
 
 ### Memory categories
 
@@ -499,6 +523,7 @@ All generated runtime files are kept under `data/` and gitignored as a single en
 | `data/reminders.json` | Pending reminders (rescheduled on restart) |
 | `data/watches.json` | Active URL watches (rescheduled on restart) |
 | `data/scheduled_tasks.json` | Recurring scheduled tasks (rescheduled on restart) |
+| `data/memory_consolidation_state.json` | Last-run timestamp for incremental memory consolidation scans |
 | `data/history/` | Per-session conversation history (one JSON file per Matrix room / HTTP session) |
 | `data/workspace_index.json` | Vector index for semantic workspace search |
 | `data/nio_store/` | Matrix E2EE session keys |

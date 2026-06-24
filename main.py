@@ -24,6 +24,7 @@ import app.tools.monitor     # registers watch_url, unwatch_url, list_watches on
 import app.tools.scheduled_tasks  # registers create_scheduled_task, list_scheduled_tasks, cancel_scheduled_task onto tool_manager
 import app.tools.subagent    # registers delegate_task onto tool_manager
 import app.tools.tasks       # registers plan_steps, finish_step onto tool_manager
+import app.tools.memory_consolidation  # registers consolidate_memories onto tool_manager
 from app.triggers.cli import CLITrigger
 from app.triggers.http import HTTPTrigger
 from app.triggers.matrix import MatrixTrigger
@@ -104,6 +105,9 @@ async def run(args: argparse.Namespace) -> None:
     # Schedule daily briefing if configured
     if DAILY_BRIEFING_TIME:
         _setup_daily_briefing(server)
+
+    # Schedule memory consolidation if configured
+    app.tools.memory_consolidation.setup_consolidation_schedule(server)
 
     try:
         await server.start()
