@@ -1,6 +1,6 @@
 # Pino
 
-Pino is a self-hosted AI agent with persistent memory, a pluggable tool system, and support for multiple simultaneous input channels. Input arrives through **triggers** (CLI, HTTP, Matrix), gets processed by an async agent loop backed by an OpenAI-compatible LLM, and results are routed back through the same trigger. A built-in scheduler enables proactive features — reminders, URL monitoring, and a daily briefing — that the agent can deliver unprompted.
+Pino is a self-hosted AI agent with persistent memory, a pluggable tool system, and support for multiple simultaneous input channels. Input arrives through **triggers** (CLI, HTTP, Matrix), gets processed by an async agent loop backed by an OpenAI-compatible LLM, and results are routed back through the same trigger. A built-in scheduler enables proactive features — reminders, URL monitoring, recurring scheduled prompts, and a daily briefing — that the agent can deliver unprompted.
 
 ## Architecture
 
@@ -10,7 +10,8 @@ Trigger → TriggerEvent → CoreServer → AgentLoop → LLM (Ollama / OpenAI-c
                                              ToolManager
                          (search, weather, fetch, calculate, memory, react,
                           files, semantic search, code execution, calendar,
-                          reminders, URL monitoring, background tasks)
+                          reminders, URL monitoring, background tasks,
+                          scheduled tasks, sub-agents)
 
 Scheduler → fire_proactive() → MatrixTrigger → room_send()
 ```
@@ -50,6 +51,7 @@ pip install -r requirements.txt
 | `HISTORY_DIR` | `data/history` | Per-session conversation history files |
 | `MAX_PERSISTED_HISTORY` | `200` | Maximum messages saved per session history file |
 | `WATCHES_FILE` | `data/watches.json` | Persistent URL watch store |
+| `SCHEDULED_TASKS_FILE` | `data/scheduled_tasks.json` | Persistent recurring scheduled task store |
 | `OLLAMA_NUM_CTX` | `8192` | Context window tokens passed to Ollama per request (Ollama default 2048 is too small for tool use) |
 | `MAX_TOOL_RESULT_CHARS` | `3000` | Truncate individual tool results to this length before adding to the message list |
 | `MAX_MESSAGES_CHARS` | auto | Character budget for the messages list; defaults to `OLLAMA_NUM_CTX × 4 − 16000` |
@@ -149,7 +151,41 @@ Set `CODE_EXEC_TIMEOUT` (default 30 s, max 120 s) and `CODE_MAX_OUTPUT_CHARS` (d
 
 ## Background tasks
 
-The agent can start long-running tasks that continue after the current response using the `start_background_task` tool. Results are delivered back to the user via the same `respond_fn` channel when the task completes. Tasks can optionally start after a delay.
+The agent can start long-running tasks that continue after the current response using the `start_background_task` tool. Results are delivered back to the user when the task completes — via the originating channel if still connected, or as a proactive notification otherwise. Tasks can optionally start after a delay.
+
+## Recurring scheduled tasks
+
+Users can ask the agent to set up recurring prompts that fire on a schedule and deliver results proactively, without any future user interaction:
+
+```text
+> Every weekday at 8am, check the weather in Helsinki and summarise my calendar for the day.
+
+Scheduled task created (cron '0 8 * * 1-5'): 'Every weekday at 8am, check the weather in…' (id: a1b2c3d4)
+
+[Monday 08:00]
+📅 Morning briefing
+Helsinki: Partly cloudy, 12°C. Today's calendar: standup at 09:00, team lunch at 12:30.
+```
+
+- Specify `interval_minutes` (e.g. 60 for hourly) or a 5-field cron expression (e.g. `0 8 * * 1-5` for weekdays at 08:00)
+- Tasks are persisted to `SCHEDULED_TASKS_FILE` and restored on restart
+- Use `list_scheduled_tasks` to see active tasks and `cancel_scheduled_task` to remove one
+
+## Sub-agents
+
+The `delegate_task` tool lets the agent hand off a complex sub-task to a fresh agent instance and receive the result inline, within its own reasoning loop. This is useful for:
+
+- **Decomposing long work** — each sub-task runs in a fresh loop with its own step budget, so the parent never hits the `max_steps` limit trying to do everything itself
+- **Parallel independent work** — calling `delegate_task` multiple times in a single step runs all sub-agents concurrently (the loop executes all tool calls with `asyncio.gather`)
+
+```text
+> Research the pros and cons of SQLite vs PostgreSQL for a small web app, then write a recommendation.
+
+[agent delegates "research SQLite strengths/weaknesses" and "research PostgreSQL strengths/weaknesses" in parallel,
+then synthesises the two results into a final recommendation]
+```
+
+Sub-agent nesting is capped at 2 levels to prevent runaway recursion. For fire-and-forget work, use `start_background_task` instead.
 
 ## Reminders
 
@@ -327,7 +363,11 @@ All users in a room share the same conversation history. The agent sees messages
 | `recall_memory(query?)` | Semantic + keyword search over stored memories | `EMBEDDING_MODEL` (optional) |
 | `delete_memory(key)` | Remove a stored memory by key | — |
 | `run_python(code, timeout?)` | Execute Python in a sandboxed subprocess; workspace-only file I/O, subprocess blocked | — |
-| `start_background_task(task, delay_seconds?)` | Run a task asynchronously; delivers result to user when done | — |
+| `start_background_task(task, delay_seconds?)` | Run a task asynchronously; delivers result to user when done (proactive fallback if original channel is gone) | — |
+| `delegate_task(prompt)` | Delegate a sub-task to a fresh agent instance; returns result inline for chaining | — |
+| `create_scheduled_task(prompt, label?, interval_minutes?, cron_expr?)` | Set up a recurring prompt that runs on a schedule and delivers results proactively | — |
+| `list_scheduled_tasks()` | Show all recurring scheduled tasks with IDs, schedules, and last run info | — |
+| `cancel_scheduled_task(task_id)` | Cancel a recurring scheduled task by ID | — |
 | `list_files(path?)` | List files and directories in the workspace | — |
 | `find_files(pattern)` | Glob search in the workspace, e.g. `**/*.md` | — |
 | `read_file(path, start_line?, end_line?)` | Read a text file from the workspace (100 KB limit; range supported) | — |
@@ -433,6 +473,7 @@ All generated runtime files are kept under `data/` and gitignored as a single en
 | `data/memory.json` | Persistent agent memory store |
 | `data/reminders.json` | Pending reminders (rescheduled on restart) |
 | `data/watches.json` | Active URL watches (rescheduled on restart) |
+| `data/scheduled_tasks.json` | Recurring scheduled tasks (rescheduled on restart) |
 | `data/history/` | Per-session conversation history (one JSON file per Matrix room / HTTP session) |
 | `data/workspace_index.json` | Vector index for semantic workspace search |
 | `data/nio_store/` | Matrix E2EE session keys |

@@ -28,18 +28,21 @@ pino/
 │       ├── memory.py            # save_memory, recall_memory, delete_memory (JSON + embeddings via app.embed)
 │       ├── reactions.py         # react tool (ContextVar-based, async)
 │       ├── fetch.py             # fetch_page tool (SSRF-safe web page text extraction)
-│       ├── background.py        # start_background_task tool (asyncio tasks)
+│       ├── background.py        # start_background_task tool (asyncio tasks, fire_proactive fallback)
 │       ├── files.py             # list_files, find_files, read_file, write_file, append_file, patch_file, download_file, search_files
 │       ├── share.py             # share_file tool (ContextVar-based, trigger-aware delivery)
 │       ├── calendar.py          # get_calendar_events (multi-calendar ICS, RRULE support)
 │       ├── reminder.py          # set_reminder, list_reminders, cancel_reminder (APScheduler date jobs)
 │       ├── monitor.py           # watch_url, unwatch_url, list_watches (APScheduler interval jobs)
+│       ├── scheduled_tasks.py   # create_scheduled_task, list_scheduled_tasks, cancel_scheduled_task (APScheduler interval/cron jobs)
+│       ├── subagent.py          # delegate_task (inline sub-agent with depth limit, parallel-friendly)
 │       └── code.py              # run_python (sandboxed subprocess execution, workspace-only I/O)
 ├── data/                        # Runtime data — gitignored; created automatically on first run
 │   ├── agent_history.jsonl      # Structured JSONL event log
 │   ├── memory.json              # Persistent memory store
 │   ├── reminders.json           # Pending reminders
 │   ├── watches.json             # Active URL watches
+│   ├── scheduled_tasks.json     # Recurring scheduled task store
 │   ├── workspace_index.json     # Vector index for search_files_semantic
 │   ├── history/                 # Per-session conversation history files
 │   ├── nio_store/               # Matrix E2EE session keys
@@ -136,7 +139,7 @@ The subprocess runs with `cwd=WORKSPACE_DIR`, a minimal environment (`PATH`, `PY
 
 `app/scheduler.py` holds a singleton `AsyncIOScheduler` and a list of registered proactive handlers. Any component that can send unsolicited messages (e.g. `MatrixTrigger`) registers an async `(room_id: str | None, text: str) -> None` handler at startup. Callers use `fire_proactive(room_id, text)` — `room_id=None` broadcasts to all configured rooms.
 
-The scheduler is started in `main.py` before triggers and stopped in the `finally` block. On startup, both `app.tools.reminder.load_and_schedule_pending()` and `app.tools.monitor.load_and_schedule_pending()` restore persisted jobs.
+The scheduler is started in `main.py` before triggers and stopped in the `finally` block. On startup, `app.tools.reminder.load_and_schedule_pending()`, `app.tools.monitor.load_and_schedule_pending()`, and `app.tools.scheduled_tasks.load_and_schedule_pending(server)` restore persisted jobs.
 
 ### URL monitoring
 
@@ -148,7 +151,29 @@ The scheduler is started in `main.py` before triggers and stopped in the `finall
 4. If the hash differs from the stored baseline, calls `fire_proactive(room_id, notification)` and updates the stored hash
 5. First successful fetch only stores the baseline — no notification
 
-The `monitor_room_id` ContextVar is set in `AgentLoop.run()` alongside `reminder_room_id`, so watches created from a Matrix room are automatically associated with that room.
+The `monitor_room_id` ContextVar is set in `AgentLoop.run()` alongside `reminder_room_id` and `scheduled_task_room_id`, so watches created from a Matrix room are automatically associated with that room.
+
+### Recurring scheduled tasks
+
+`app/tools/scheduled_tasks.py` stores tasks in `SCHEDULED_TASKS_FILE` (default: `data/scheduled_tasks.json`). Each entry records the prompt, label, schedule (interval minutes or cron expression), room_id, and run statistics.
+
+`load_and_schedule_pending(server)` is called from `main.py` after the scheduler starts and requires a `server` reference (unlike reminders/monitors which only need the scheduler) because tasks execute via `server.handle_event()`, which wires up the full agent loop.
+
+When a scheduled task fires:
+
+1. The run count and `last_run` timestamp are updated in the JSON store.
+2. A `TriggerEvent` is created with `source="scheduler"` and a `respond_fn` that calls `fire_proactive(room_id, ...)`.
+3. `server.handle_event(event)` runs the full agent loop; the final result is delivered proactively.
+
+### Background task notifications
+
+`app/tools/background.py` now stores the `room_id` alongside the LLM, tools, and push_fn in ContextVars. When a background task completes it first tries `push_fn` (the `respond_fn` from the original request); if that fails or is absent it falls back to `fire_proactive(room_id, ...)`. The room_id is also injected into the background `TriggerEvent`'s metadata so reminders and watches set within the background task are associated with the correct room.
+
+### Sub-agents
+
+`app/tools/subagent.py` implements `delegate_task`. It reads the LLM and tools from the ContextVars set by `set_background_context` (shared with background tasks), creates a fresh `TriggerEvent` with `source="subagent"`, and awaits a new `AgentLoop.run()` call directly — not as a separate asyncio task. The result string is returned to the calling agent's tool chain.
+
+A `_depth_var` ContextVar tracks nesting depth. Each `delegate_task` call increments it (using `ContextVar.reset` in a `finally` block) and rejects calls when depth ≥ `_MAX_DEPTH` (2). Because the agent loop runs all tool calls via `asyncio.gather` (which wraps each in a task that inherits the current context), multiple `delegate_task` calls in a single step execute concurrently while each independently tracks its own depth.
 
 ### ToolManager
 
