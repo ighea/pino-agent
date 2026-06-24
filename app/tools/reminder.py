@@ -8,7 +8,7 @@ from pathlib import Path
 
 from app.tools.builtin import tool_manager
 
-_REMINDERS_FILE = Path(os.getenv("REMINDERS_FILE", "reminders.json"))
+_REMINDERS_FILE = Path(os.getenv("REMINDERS_FILE", "data/reminders.json"))
 
 _room_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "reminder_room_id", default=None
