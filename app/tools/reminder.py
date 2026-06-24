@@ -5,10 +5,16 @@ import json
 import os
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.tools.builtin import tool_manager
 
 _REMINDERS_FILE = Path(os.getenv("REMINDERS_FILE", "data/reminders.json"))
+_AGENT_TZ_NAME = os.getenv("AGENT_TZ", "UTC")
+try:
+    _AGENT_TZ: datetime.tzinfo = ZoneInfo(_AGENT_TZ_NAME)
+except ZoneInfoNotFoundError:
+    _AGENT_TZ = datetime.timezone.utc
 
 _room_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "reminder_room_id", default=None
@@ -66,7 +72,7 @@ def _set_reminder(when: str, message: str) -> str:
         return f"Error: invalid datetime '{when}'. Use ISO 8601, e.g. 2026-06-23T15:00:00."
 
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt = dt.replace(tzinfo=_AGENT_TZ)
 
     now = datetime.datetime.now(datetime.timezone.utc)
     if dt <= now:

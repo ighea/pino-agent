@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import traceback
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.llm.base import BaseLLM
 from app.logger import logger
@@ -16,6 +17,12 @@ from app.tools.share import set_deliver_fn
 from app.triggers.base import TriggerEvent
 
 AGENT_PERSONA = os.getenv("AGENT_PERSONA", "")
+_AGENT_TZ_NAME = os.getenv("AGENT_TZ", "UTC")
+try:
+    _AGENT_TZ = ZoneInfo(_AGENT_TZ_NAME)
+except ZoneInfoNotFoundError:
+    _AGENT_TZ = datetime.timezone.utc
+    _AGENT_TZ_NAME = "UTC"
 
 # Character budget for the messages list (excluding system prompt).
 # Derived from OLLAMA_NUM_CTX * ~4 chars/token, minus fixed overhead for
@@ -103,8 +110,8 @@ SYSTEM_PROMPT = (
 
 
 def _build_system_prompt() -> str:
-    now = datetime.datetime.now(datetime.timezone.utc)
-    now_str = now.strftime("%A, %Y-%m-%d %H:%M UTC")
+    now = datetime.datetime.now(_AGENT_TZ)
+    now_str = now.strftime(f"%A, %Y-%m-%d %H:%M {_AGENT_TZ_NAME}")
     parts = [SYSTEM_PROMPT, f"Current date and time: {now_str}."]
     if AGENT_PERSONA:
         parts.append(f"Persona: {AGENT_PERSONA}")
