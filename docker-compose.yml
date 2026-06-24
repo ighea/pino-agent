@@ -17,14 +17,14 @@ services:
       OLLAMA_BASE_URL: "http://host.docker.internal:11434"
       OPENAI_BASE_URL: "http://host.docker.internal:11434/v1"
       OPENAI_API_KEY: "ollama"
-      OPENAI_MODEL: "gemma4:latest"
+      OPENAI_MODEL: "gemma4:e4b"
       BRAVE_API_KEY: "${BRAVE_API_KEY:-}"
       OPENWEATHERMAP_API_KEY: "${OPENWEATHERMAP_API_KEY:-}"
       MATRIX_HOMESERVER: "${MATRIX_HOMESERVER:-}"
       MATRIX_USER: "${MATRIX_USER:-}"
       MATRIX_PASSWORD: "${MATRIX_PASSWORD:-}"
       MATRIX_ROOM_IDS: "${MATRIX_ROOM_IDS:-}"
-      MATRIX_STORE_PATH: "/code/nio_store"
+      MATRIX_STORE_PATH: "/code/data/nio_store"
       HTTP_API_KEY: "${HTTP_API_KEY:-}"
       AIDER_CONFIG: /code/aider.json
     command: python main.py --mode all

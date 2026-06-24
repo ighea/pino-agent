@@ -5,11 +5,13 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+from app.llm.base import BaseLLM
 from app.llm.openai_provider import OpenAIProvider
+from app.llm.text_tool_calling import TextToolCallingLLM
 from app.server import CoreServer
 from app.tools.builtin import tool_manager
-import app.tools.memory     # registers memory tools onto tool_manager
-import app.tools.reactions  # registers react tool onto tool_manager
+import app.tools.memory      # registers memory tools onto tool_manager
+import app.tools.reactions   # registers react tool onto tool_manager
 import app.tools.fetch       # registers fetch_page tool onto tool_manager
 import app.tools.background  # registers start_background_task tool onto tool_manager
 import app.tools.files       # registers list_files, find_files, read_file, write_file onto tool_manager
@@ -67,8 +69,13 @@ DAILY_BRIEFING_PROMPT = os.getenv(
 )
 
 
+TEXT_TOOL_CALLING = os.getenv("LLM_TEXT_TOOL_CALLING", "1") == "1"
+
+
 async def run(args: argparse.Namespace) -> None:
-    llm = OpenAIProvider()
+    llm: BaseLLM = OpenAIProvider()
+    if TEXT_TOOL_CALLING:
+        llm = TextToolCallingLLM(llm)
     fast_llm = OpenAIProvider(model=FAST_MODEL) if FAST_MODEL else None
     server = CoreServer(llm=llm, tools=tool_manager, fast_llm=fast_llm)
 

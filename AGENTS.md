@@ -9,7 +9,7 @@ pino/
 │   ├── server.py                # CoreServer: trigger registry + event dispatch
 │   ├── agent.py                 # AgentLoop: LLM ↔ tool call orchestration + quick ack
 │   ├── summarizer.py            # Conversation summarization (compresses old history turns)
-│   ├── logger.py                # Structured JSONL logging → agent_history.jsonl
+│   ├── logger.py                # Structured JSONL logging → data/agent_history.jsonl
 │   ├── scheduler.py             # APScheduler singleton + proactive message handler registry
 │   ├── triggers/
 │   │   ├── base.py              # TriggerEvent dataclass + BaseTrigger interface
@@ -30,8 +30,14 @@ pino/
 │       ├── share.py             # share_file tool (ContextVar-based, trigger-aware delivery)
 │       ├── calendar.py          # get_calendar_events (multi-calendar ICS, RRULE support)
 │       └── reminder.py          # set_reminder, list_reminders, cancel_reminder (APScheduler)
+├── data/                        # Runtime data — gitignored; created automatically on first run
+│   ├── agent_history.jsonl      # Structured JSONL event log
+│   ├── memory.json              # Persistent memory store
+│   ├── reminders.json           # Pending reminders
+│   ├── nio_store/               # Matrix E2EE session keys
+│   └── workspace/               # Sandboxed file tool workspace
 ├── .env.example                 # Documents all env vars — copy to .env and fill in
-├── .claudeignore                # Prevents Claude from reading .env and memory.json
+├── .claudeignore                # Prevents Claude from reading .env and data/
 ├── requirements.txt
 └── docker-compose.yml
 ```
@@ -80,7 +86,7 @@ Per-request state (`react_fn`, `deliver_fn`, `llm`, `tools`, `push_fn` for backg
 
 `app/scheduler.py` holds a singleton `AsyncIOScheduler` and a list of registered proactive handlers. Any component that can send unsolicited messages (e.g. `MatrixTrigger`) registers an async `(room_id: str | None, text: str) -> None` handler at startup. Callers use `fire_proactive(room_id, text)` — `room_id=None` broadcasts to all configured rooms.
 
-The scheduler is started in `main.py` before triggers and stopped in the `finally` block. Reminders are persisted to `REMINDERS_FILE` (default: `reminders.json`) and rescheduled on startup via `load_and_schedule_pending()`.
+The scheduler is started in `main.py` before triggers and stopped in the `finally` block. Reminders are persisted to `REMINDERS_FILE` (default: `data/reminders.json`) and rescheduled on startup via `load_and_schedule_pending()`.
 
 ### ToolManager
 
@@ -101,7 +107,7 @@ The shared `tool_manager` instance lives in `app/tools/builtin.py` and is import
 
 ### Workspace file tools
 
-All file tools operate inside `WORKSPACE_DIR` (default: `<project_root>/workspace`). `_safe_path()` in `app/tools/files.py` resolves every user-supplied path and rejects anything that escapes the workspace root via `Path.relative_to()`. The workspace directory is created on first use.
+All file tools operate inside `WORKSPACE_DIR` (default: `data/workspace`). `_safe_path()` in `app/tools/files.py` resolves every user-supplied path and rejects anything that escapes the workspace root via `Path.relative_to()`. The workspace directory is created on first use.
 
 `share_file` in `app/tools/share.py` uses a `deliver_fn` ContextVar. Each trigger sets its own implementation:
 
@@ -117,15 +123,16 @@ All file tools operate inside `WORKSPACE_DIR` (default: `<project_root>/workspac
 | --- | --- | --- |
 | `OPENAI_BASE_URL` | `http://host.docker.internal:11434/v1` | LLM endpoint |
 | `OPENAI_API_KEY` | `ollama` | API key |
-| `OPENAI_MODEL` | `gemma4:latest` | Primary model name |
+| `OPENAI_MODEL` | `gemma4:e4b` | Primary model name |
 | `FAST_MODEL` | `qwen2.5:1.5b` | Quick-ack model; set empty to disable |
 | `BRAVE_API_KEY` | — | Brave Search (required for web search) |
 | `OPENWEATHERMAP_API_KEY` | — | OpenWeatherMap (required for weather) |
-| `MEMORY_FILE` | `memory.json` | Persistent memory store path |
+| `AGENT_LOG_FILE` | `data/agent_history.jsonl` | Structured event log path |
+| `MEMORY_FILE` | `data/memory.json` | Persistent memory store path |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model for semantic memory |
 | `MAX_HISTORY_TURNS` | `20` | Summarize when history exceeds this |
 | `SUMMARY_KEEP_RECENT` | `6` | Verbatim turns kept after summarization |
-| `WORKSPACE_DIR` | `<project_root>/workspace` | Sandboxed directory for file tools |
+| `WORKSPACE_DIR` | `data/workspace` | Sandboxed directory for file tools |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
 | `HTTP_PORT` | `8000` | HTTP trigger port |
 | `HTTP_API_KEY` | — | Bearer token for HTTP auth; unset = open |
@@ -134,10 +141,10 @@ All file tools operate inside `WORKSPACE_DIR` (default: `<project_root>/workspac
 | `MATRIX_USER` | — | Bot Matrix ID |
 | `MATRIX_PASSWORD` | — | Bot account password |
 | `MATRIX_ROOM_IDS` | — | Comma-separated room IDs |
-| `MATRIX_STORE_PATH` | `./nio_store` | E2EE key storage path |
+| `MATRIX_STORE_PATH` | `./data/nio_store` | E2EE key storage path |
 | `MATRIX_MAX_MSG_LEN` | `4000` | Split Matrix messages at this character count |
 | `CALENDAR_<name>` | — | ICS URL for a named calendar (e.g. `CALENDAR_WORK=…`) |
-| `REMINDERS_FILE` | `reminders.json` | Persistent reminder store path |
+| `REMINDERS_FILE` | `data/reminders.json` | Persistent reminder store path |
 | `DAILY_BRIEFING_TIME` | — | `HH:MM` to fire the daily briefing (unset = disabled) |
 | `DAILY_BRIEFING_TZ` | `UTC` | Timezone for `DAILY_BRIEFING_TIME` (e.g. `Europe/Helsinki`) |
 | `DAILY_BRIEFING_PROMPT` | see .env.example | Agent prompt for the daily briefing |
@@ -199,5 +206,4 @@ Provide all four callbacks (`respond_fn`, `status_fn`, `react_fn`, `deliver_fn`)
 - **API keys never in error messages**: catch HTTP error codes explicitly; return plain string error messages.
 - **All async**: triggers, agent loop, tool dispatch (sync tools run in `run_in_executor`).
 - **No comments explaining what code does** — only for non-obvious constraints, invariants, or workarounds.
-- **`.env` and `memory.json` are gitignored and claudeignored** — never commit them.
-
+- **`.env` and `data/` are gitignored** — never commit them.

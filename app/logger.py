@@ -1,16 +1,17 @@
 import datetime
 import os
 import json
+from pathlib import Path
 
 class AgentLogger:
     """
     Manages logging and history persistence for the agent framework.
     Stores all events (inputs, outputs, tool calls) chronologically.
     """
-    LOG_FILE = "agent_history.jsonl"
+    LOG_FILE = os.getenv("AGENT_LOG_FILE", "data/agent_history.jsonl")
 
     def __init__(self):
-        # Check if we should use a global or instance logger
+        Path(self.LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
         if not os.path.exists(self.LOG_FILE):
             print(f"Initializing new agent history log file at {self.LOG_FILE}")
         else:
