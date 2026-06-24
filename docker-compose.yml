@@ -27,6 +27,7 @@ services:
       MATRIX_STORE_PATH: "/code/data/nio_store"
       HTTP_API_KEY: "${HTTP_API_KEY:-}"
       AIDER_CONFIG: /code/aider.json
+      AGENT_TZ: "${AGENT_TZ:-UTC}"
     command: python main.py --mode all
     stdin_open: true
     tty: true
