@@ -9,40 +9,59 @@ _tools_var: contextvars.ContextVar = contextvars.ContextVar("bg_tools", default=
 _push_fn_var: contextvars.ContextVar[Callable[[str], Awaitable[None]] | None] = (
     contextvars.ContextVar("bg_push_fn", default=None)
 )
+_room_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "bg_room_id", default=None
+)
 
 
-def set_background_context(llm, tools, push_fn) -> None:
+def set_background_context(llm, tools, push_fn, room_id: str | None = None) -> None:
     _llm_var.set(llm)
     _tools_var.set(tools)
     _push_fn_var.set(push_fn)
+    _room_id_var.set(room_id)
 
 
-async def _run_task(task: str, push_fn, llm, tools, delay: float) -> None:
+async def _notify(push_fn, room_id: str | None, text: str) -> None:
+    """Deliver text via push_fn; fall back to fire_proactive if push_fn raises or is None."""
+    if push_fn:
+        try:
+            await push_fn(text)
+            return
+        except Exception:
+            pass
+    from app import scheduler as _scheduler
+    await _scheduler.fire_proactive(room_id, text)
+
+
+async def _run_task(task: str, push_fn, llm, tools, delay: float, room_id: str | None) -> None:
     from app.agent import AgentLoop
     from app.triggers.base import TriggerEvent
 
     if delay > 0:
         await asyncio.sleep(delay)
 
-    event = TriggerEvent(input=task, source="background")
+    event = TriggerEvent(
+        input=task,
+        source="background",
+        metadata={"room_id": room_id} if room_id else {},
+    )
     try:
         result = await AgentLoop(llm=llm, tools=tools).run(event)
-        if push_fn:
-            await push_fn(f"**[Background task complete]**\n{result}")
+        await _notify(push_fn, room_id, f"**[Background task complete]**\n{result}")
     except Exception as e:
-        if push_fn:
-            await push_fn(f"**[Background task failed]** {e}")
+        await _notify(push_fn, room_id, f"**[Background task failed]** {e}")
 
 
 async def _start_background_task(task: str, delay_seconds: float = 0) -> str:
     llm = _llm_var.get()
     tools = _tools_var.get()
     push_fn = _push_fn_var.get()
+    room_id = _room_id_var.get()
 
     if llm is None or tools is None:
         return "Error: Background tasks are not available in this context."
 
-    asyncio.create_task(_run_task(task, push_fn, llm, tools, delay_seconds))
+    asyncio.create_task(_run_task(task, push_fn, llm, tools, delay_seconds, room_id))
 
     if delay_seconds > 0:
         m, s = divmod(int(delay_seconds), 60)

@@ -15,6 +15,7 @@ from app.tools.memory import get_core_memories
 from app.tools.monitor import set_monitor_context
 from app.tools.reactions import set_react_fn
 from app.tools.reminder import set_reminder_context
+from app.tools.scheduled_tasks import set_scheduled_task_context
 from app.tools.share import set_deliver_fn
 from app.triggers.base import TriggerEvent
 
@@ -124,7 +125,11 @@ SYSTEM_PROMPT = (
     "read_file with start_line/end_line to read specific sections, write_file to create or overwrite files, "
     "append_file to add to existing files, and patch_file to replace specific lines without rewriting the whole file. "
     "Use set_reminder to schedule reminders — calculate the target ISO 8601 datetime from the "
-    "current date/time provided in this prompt."
+    "current date/time provided in this prompt. "
+    "Use create_scheduled_task to set up recurring prompts (e.g. daily briefings, periodic checks) "
+    "with interval_minutes or a cron expression. "
+    "Use delegate_task to hand off a complex sub-task to a fresh agent instance and receive the "
+    "result inline — ideal for decomposing multi-part work or running independent sub-tasks in parallel."
 )
 
 
@@ -245,11 +250,13 @@ class AgentLoop:
         if event.history:
             event.history[:] = await maybe_summarize(event.history, self.llm)
 
+        room_id = event.metadata.get("room_id")
         set_react_fn(event.react_fn)
         set_deliver_fn(event.deliver_fn)
-        set_background_context(self.llm, self.tools, event.respond_fn)
-        set_reminder_context(event.metadata.get("room_id"))
-        set_monitor_context(event.metadata.get("room_id"))
+        set_background_context(self.llm, self.tools, event.respond_fn, room_id)
+        set_reminder_context(room_id)
+        set_monitor_context(room_id)
+        set_scheduled_task_context(room_id)
 
         if self.fast_llm and event.respond_fn and event.source not in ("scheduler", "background"):
             asyncio.create_task(self._quick_ack(event))

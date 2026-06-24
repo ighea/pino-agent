@@ -21,6 +21,8 @@ import app.tools.reminder    # registers set_reminder, list_reminders, cancel_re
 import app.workspace_index   # registers search_files_semantic onto tool_manager
 import app.tools.code        # registers run_python onto tool_manager
 import app.tools.monitor     # registers watch_url, unwatch_url, list_watches onto tool_manager
+import app.tools.scheduled_tasks  # registers create_scheduled_task, list_scheduled_tasks, cancel_scheduled_task onto tool_manager
+import app.tools.subagent    # registers delegate_task onto tool_manager
 from app.triggers.cli import CLITrigger
 from app.triggers.http import HTTPTrigger
 from app.triggers.matrix import MatrixTrigger
@@ -96,6 +98,7 @@ async def run(args: argparse.Namespace) -> None:
     _scheduler.start()
     app.tools.reminder.load_and_schedule_pending()
     app.tools.monitor.load_and_schedule_pending()
+    app.tools.scheduled_tasks.load_and_schedule_pending(server)
 
     # Schedule daily briefing if configured
     if DAILY_BRIEFING_TIME:
