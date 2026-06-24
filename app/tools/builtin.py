@@ -11,6 +11,7 @@ tool_manager = ToolManager()
 
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_IMAGE_SEARCH_URL = "https://api.search.brave.com/res/v1/images/search"
 
 OWM_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY", "")
 OWM_URL = "https://api.openweathermap.org/data/2.5/weather"
@@ -39,6 +40,35 @@ def _search_web(query: str, count: int = 5) -> str:
     lines = []
     for r in results:
         lines.append(f"- {r.get('title', '')}\n  {r.get('url', '')}\n  {r.get('description', '')}")
+    return "\n\n".join(lines)
+
+
+def _search_images(query: str, count: int = 5) -> str:
+    if not BRAVE_API_KEY:
+        return "Error: BRAVE_API_KEY environment variable is not set."
+    resp = _requests.get(
+        BRAVE_IMAGE_SEARCH_URL,
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_API_KEY,
+        },
+        params={"q": query, "count": count},
+        timeout=10,
+    )
+    if resp.status_code == 401:
+        return "Error: Brave Search API key is invalid or unauthorised."
+    if not resp.ok:
+        return f"Error: Brave Image Search returned HTTP {resp.status_code}."
+    results = resp.json().get("results", [])
+    if not results:
+        return "No image results found."
+    lines = []
+    for r in results:
+        title = r.get("title", "")
+        image_url = r.get("properties", {}).get("url", "") or r.get("url", "")
+        source = r.get("url", "") or r.get("page_url", "")
+        lines.append(f"- {title}\n  Image URL: {image_url}\n  Source: {source}")
     return "\n\n".join(lines)
 
 
@@ -130,6 +160,23 @@ tool_manager.register(
         "required": ["query"],
     },
     status_template='Searching the web for: "{query}"',
+)
+
+tool_manager.register(
+    name="search_images",
+    fn=_search_images,
+    description=(
+        "Search for images using Brave Image Search. Returns image URLs, titles, and source pages. "
+        "Use download_file to save an image to the workspace, then share_file to deliver it to the user."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The image search query."},
+        },
+        "required": ["query"],
+    },
+    status_template='Searching images for: "{query}"',
 )
 
 tool_manager.register(

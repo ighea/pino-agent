@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import os
+import random
 import traceback
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -33,6 +34,23 @@ _MAX_MESSAGES_CHARS = int(os.getenv("MAX_MESSAGES_CHARS", str(_NUM_CTX * 4 - 16_
 _MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "3000"))
 # Appended to every tool result to keep weak models anchored to the task after tool calls.
 _TOOL_RESULT_NUDGE = "\n\n(Use the above to answer the user's question. Do not greet the user.)"
+
+_THINKING_PHRASES = [
+    "Thinking...",
+    "Pondering...",
+    "Reasoning...",
+    "Working on it...",
+    "Considering...",
+    "On it...",
+    "Figuring this out...",
+    "Let me think...",
+    "Processing...",
+    "Mulling it over...",
+]
+
+
+def _thinking_status() -> str:
+    return random.choice(_THINKING_PHRASES)
 
 
 def _trim_messages(messages: list[dict]) -> list[dict]:
@@ -239,10 +257,13 @@ class AgentLoop:
             *event.history,
             {"role": "user", "content": event.input},
         ]
+        # Index of the current user message — used to strip history on context overflow.
+        _turn_start = len(messages) - 1
+        _history_stripped = False
         schemas = self.tools.get_openai_schemas() or None
 
         logger.log_input(event.input, source=event.source)
-        await self._status(event, "Thinking...")
+        await self._status(event, _thinking_status())
 
         empty_retries = 0
         _max_empty_retries = 2
@@ -283,12 +304,25 @@ class AgentLoop:
                     if len(result) > _MAX_TOOL_RESULT_CHARS:
                         result = result[:_MAX_TOOL_RESULT_CHARS] + "\n[truncated]"
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result + _TOOL_RESULT_NUDGE})
-                await self._status(event, "Thinking...")
+                await self._status(event, _thinking_status())
                 continue
 
             final = (msg.content or "").strip()
             if not final:
                 messages.pop()
+                if choice.finish_reason == "length" and not _history_stripped:
+                    # Context window full: strip conversation history and retry with
+                    # only the system prompt + current user message + tool chain so far.
+                    kept = [messages[0]] + messages[_turn_start:]
+                    messages[:] = kept
+                    _turn_start = 1
+                    _history_stripped = True
+                    logger.log_error(
+                        "Context overflow — stripped history and retrying",
+                        {"model": self.llm.model, "step": step, "kept_messages": len(messages)},
+                    )
+                    await self._status(event, _thinking_status())
+                    continue
                 empty_retries += 1
                 logger.log_error(
                     "LLM returned empty response",
@@ -296,7 +330,7 @@ class AgentLoop:
                 )
                 if empty_retries > _max_empty_retries:
                     return "I wasn't able to generate a response. Please try rephrasing your question."
-                await self._status(event, "Thinking...")
+                await self._status(event, _thinking_status())
                 continue
 
             logger.log_final_output(final)
