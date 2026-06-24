@@ -11,7 +11,7 @@ Trigger → TriggerEvent → CoreServer → AgentLoop → LLM (Ollama / OpenAI-c
                          (search, weather, fetch, calculate, memory, react,
                           files, semantic search, code execution, calendar,
                           reminders, URL monitoring, background tasks,
-                          scheduled tasks, sub-agents)
+                          scheduled tasks, sub-agents, task planning)
 
 Scheduler → fire_proactive() → MatrixTrigger → room_send()
 ```
@@ -170,6 +170,29 @@ Helsinki: Partly cloudy, 12°C. Today's calendar: standup at 09:00, team lunch a
 - Specify `interval_minutes` (e.g. 60 for hourly) or a 5-field cron expression (e.g. `0 8 * * 1-5` for weekdays at 08:00)
 - Tasks are persisted to `SCHEDULED_TASKS_FILE` and restored on restart
 - Use `list_scheduled_tasks` to see active tasks and `cancel_scheduled_task` to remove one
+
+## Task planning
+
+For multi-step requests the agent can optionally build an explicit task plan using `plan_steps`, then tick off each step with `finish_step` as it goes. The final `finish_step` call tells the agent it has everything it needs and prompts it to synthesise a final answer.
+
+```text
+> Research current mortgage rates in Finland, compare them to the EU average, and write a short summary.
+
+Planning task...
+  Step 0. [○] Search for current Finnish mortgage rates
+  Step 1. [○] Search for current EU average mortgage rates
+  Step 2. [○] Write a comparison summary
+
+[agent calls search tools and finishes each step in order]
+
+  Step 0. [✓] Finnish average ~3.4 % (April 2026, Nordea data)
+  Step 1. [✓] EU average ~3.8 % (ECB data)
+  Step 2. [○] Write a comparison summary
+
+Finnish mortgage rates are currently below the EU average...
+```
+
+The agent decides whether to use `plan_steps` — it is skipped for simple requests. Task state is ephemeral and cleared at the start of each turn.
 
 ## Sub-agents
 
@@ -365,6 +388,8 @@ All users in a room share the same conversation history. The agent sees messages
 | `run_python(code, timeout?)` | Execute Python in a sandboxed subprocess; workspace-only file I/O, subprocess blocked | — |
 | `start_background_task(task, delay_seconds?)` | Run a task asynchronously; delivers result to user when done (proactive fallback if original channel is gone) | — |
 | `delegate_task(prompt)` | Delegate a sub-task to a fresh agent instance; returns result inline for chaining | — |
+| `plan_steps(steps)` | Create an ordered task checklist for the current request; agent works through it with `finish_step` | — |
+| `finish_step(index, notes?)` | Mark a step done with an outcome note; returns updated checklist and next action | — |
 | `create_scheduled_task(prompt, label?, interval_minutes?, cron_expr?)` | Set up a recurring prompt that runs on a schedule and delivers results proactively | — |
 | `list_scheduled_tasks()` | Show all recurring scheduled tasks with IDs, schedules, and last run info | — |
 | `cancel_scheduled_task(task_id)` | Cancel a recurring scheduled task by ID | — |

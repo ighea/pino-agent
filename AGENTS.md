@@ -36,6 +36,7 @@ pino/
 │       ├── monitor.py           # watch_url, unwatch_url, list_watches (APScheduler interval jobs)
 │       ├── scheduled_tasks.py   # create_scheduled_task, list_scheduled_tasks, cancel_scheduled_task (APScheduler interval/cron jobs)
 │       ├── subagent.py          # delegate_task (inline sub-agent with depth limit, parallel-friendly)
+│       ├── tasks.py             # plan_steps, finish_step (ephemeral per-turn task tracking)
 │       └── code.py              # run_python (sandboxed subprocess execution, workspace-only I/O)
 ├── data/                        # Runtime data — gitignored; created automatically on first run
 │   ├── agent_history.jsonl      # Structured JSONL event log
@@ -84,7 +85,7 @@ All callbacks are optional (can be `None`). The agent never knows or cares which
 3. If `fast_llm` is set and `respond_fn` is present, fire `_quick_ack()` as a concurrent asyncio task — it sends a short acknowledgment (with a topic emoji) before the main loop starts.
 4. Build `[system, …history, user]` message list. The system prompt includes the current datetime (in `AGENT_TZ`) and core memories so the LLM always has essential context.
 5. Call the primary LLM with all registered tool schemas (with exponential-backoff retry).
-6. If the response contains `tool_calls`: emit a status message, execute all tools concurrently via `asyncio.gather`, append `tool` messages, loop.
+6. If the response contains `tool_calls`: emit a status message, execute all tools concurrently via `asyncio.gather`, append `tool` result messages, then append a single `role: user` nudge message to anchor weak models that otherwise emit an empty stop token after tool use. The nudge is stripped from `event.history` before it is persisted.
 7. If the response is plain text: call `event.respond_fn(text)` and return. Empty responses are retried up to 2 times before returning a user-facing error.
 8. If `finish_reason == "length"` (context overflow): strip history, keep only `[system, user, …tool_chain]`, retry once.
 
@@ -168,6 +169,15 @@ When a scheduled task fires:
 ### Background task notifications
 
 `app/tools/background.py` now stores the `room_id` alongside the LLM, tools, and push_fn in ContextVars. When a background task completes it first tries `push_fn` (the `respond_fn` from the original request); if that fails or is absent it falls back to `fire_proactive(room_id, ...)`. The room_id is also injected into the background `TriggerEvent`'s metadata so reminders and watches set within the background task are associated with the correct room.
+
+### Task planning
+
+`app/tools/tasks.py` implements two ephemeral tools for optional per-turn task tracking:
+
+- **`plan_steps(steps)`** — the agent calls this at the start of a complex multi-step request. It stores an ordered checklist in a module-level dict keyed by `room_id` and returns the formatted list along with an instruction to work through it sequentially.
+- **`finish_step(index, notes)`** — marks a step done, records a brief outcome note, and returns the updated checklist. The response names the next pending step (or tells the agent to synthesise if all are done).
+
+State is scoped per room and cleared at the start of every turn via `set_task_context(room_id)` in `AgentLoop.run()`. State never persists across turns. The agent chooses whether to use these tools — they add overhead and the system prompt instructs the agent to skip them for simple requests.
 
 ### Sub-agents
 

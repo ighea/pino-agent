@@ -17,6 +17,7 @@ from app.tools.reactions import set_react_fn
 from app.tools.reminder import set_reminder_context
 from app.tools.scheduled_tasks import set_scheduled_task_context
 from app.tools.share import set_deliver_fn
+from app.tools.tasks import set_task_context
 from app.triggers.base import TriggerEvent
 
 AGENT_PERSONA = os.getenv("AGENT_PERSONA", "")
@@ -34,8 +35,9 @@ _NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 _MAX_MESSAGES_CHARS = int(os.getenv("MAX_MESSAGES_CHARS", str(_NUM_CTX * 4 - 16_000)))
 # Individual tool results are truncated to this length before being added to messages.
 _MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "3000"))
-# Appended to every tool result to keep weak models anchored to the task after tool calls.
-_TOOL_RESULT_NUDGE = "\n\n(Use the above to answer the user's question. Do not greet the user.)"
+# Added as a user message after tool results to keep weak models anchored to the task.
+# Using a user role message is more effective than embedding the nudge in tool result content.
+_TOOL_RESULT_NUDGE = "(Tool calls complete. Now write your response to the user's question. Do not greet the user.)"
 
 _THINKING_PHRASES = [
     "Thinking...",
@@ -129,7 +131,10 @@ SYSTEM_PROMPT = (
     "Use create_scheduled_task to set up recurring prompts (e.g. daily briefings, periodic checks) "
     "with interval_minutes or a cron expression. "
     "Use delegate_task to hand off a complex sub-task to a fresh agent instance and receive the "
-    "result inline — ideal for decomposing multi-part work or running independent sub-tasks in parallel."
+    "result inline — ideal for decomposing multi-part work or running independent sub-tasks in parallel. "
+    "For multi-step tasks where you need to gather information from several sources before answering, "
+    "use plan_steps to lay out the steps upfront, then call finish_step after each one completes. "
+    "Only use plan_steps when the task genuinely requires multiple distinct steps — skip it for simple requests."
 )
 
 
@@ -257,6 +262,7 @@ class AgentLoop:
         set_reminder_context(room_id)
         set_monitor_context(room_id)
         set_scheduled_task_context(room_id)
+        set_task_context(room_id)
 
         if self.fast_llm and event.respond_fn and event.source not in ("scheduler", "background"):
             asyncio.create_task(self._quick_ack(event))
@@ -312,7 +318,8 @@ class AgentLoop:
                         await self._error(event, result[len("Error:"):].strip())
                     if len(result) > _MAX_TOOL_RESULT_CHARS:
                         result = result[:_MAX_TOOL_RESULT_CHARS] + "\n[truncated]"
-                    messages.append({"role": "tool", "tool_call_id": call_id, "content": result + _TOOL_RESULT_NUDGE})
+                    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+                messages.append({"role": "user", "content": _TOOL_RESULT_NUDGE})
                 await self._status(event, _thinking_status())
                 continue
 
@@ -343,9 +350,9 @@ class AgentLoop:
                 continue
 
             logger.log_final_output(final)
-            # Persist conversation turns (excluding system prompt) for next call
+            # Persist conversation turns (excluding system prompt and ephemeral nudge messages)
             event.history.clear()
-            event.history.extend(messages[1:])
+            event.history.extend(m for m in messages[1:] if m.get("content") != _TOOL_RESULT_NUDGE)
             return final
 
         return "I wasn't able to complete a response. Please try again."
