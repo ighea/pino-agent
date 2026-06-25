@@ -335,3 +335,5 @@ Provide all four callbacks (`respond_fn`, `status_fn`, `react_fn`, `deliver_fn`)
 - **All async**: triggers, agent loop, tool dispatch (sync tools run in `run_in_executor`).
 - **No comments explaining what code does** — only for non-obvious constraints, invariants, or workarounds.
 - **`.env` and `data/` are gitignored** — never commit them.
+- **Update `.env.example` for every new env var** — any variable read via `os.getenv` or `os.environ` must be documented in `.env.example` with a sensible default or placeholder and a brief inline comment explaining its purpose.
+- **Update `README.md` for user-visible changes** — new features, new env vars, changed CLI flags, or altered defaults must be reflected in `README.md` so the docs stay accurate.

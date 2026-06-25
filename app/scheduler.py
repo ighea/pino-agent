@@ -2,7 +2,9 @@ import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-_scheduler = AsyncIOScheduler()
+from app.tz import TZ_NAME
+
+_scheduler = AsyncIOScheduler(timezone=TZ_NAME)
 _proactive_handlers: list = []  # async (room_id: str | None, text: str) -> None
 
 

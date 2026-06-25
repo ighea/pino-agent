@@ -65,9 +65,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+from app.tz import TZ as _BRIEFING_TZ, TZ_NAME as _BRIEFING_TZ_NAME
+
 FAST_MODEL = os.getenv("FAST_MODEL", "qwen2.5:1.5b")
 DAILY_BRIEFING_TIME = os.getenv("DAILY_BRIEFING_TIME", "")
-DAILY_BRIEFING_TZ = os.getenv("DAILY_BRIEFING_TZ", "UTC")
 DAILY_BRIEFING_PROMPT = os.getenv(
     "DAILY_BRIEFING_PROMPT",
     "Use recall_memory to find the user's home location and any relevant preferences. "
@@ -123,20 +124,12 @@ def _setup_daily_briefing(server: CoreServer) -> None:
         print(f"[scheduler] Invalid DAILY_BRIEFING_TIME={DAILY_BRIEFING_TIME!r} — expected HH:MM, skipping briefing.")
         return
 
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(DAILY_BRIEFING_TZ)
-    except Exception as e:
-        print(f"[scheduler] Invalid DAILY_BRIEFING_TZ={DAILY_BRIEFING_TZ!r} ({e}), using UTC.")
-        import datetime
-        tz = datetime.timezone.utc
-
     async def _daily_briefing() -> None:
         import datetime
-        now = datetime.datetime.now(tz)
+        now = datetime.datetime.now(_BRIEFING_TZ)
         now_str = now.strftime("%A, %Y-%m-%d %H:%M")
         prompt = (
-            f"The current date and time is {now_str} ({DAILY_BRIEFING_TZ}). "
+            f"The current date and time is {now_str} ({_BRIEFING_TZ_NAME}). "
             f"{DAILY_BRIEFING_PROMPT}"
         )
 
@@ -155,11 +148,10 @@ def _setup_daily_briefing(server: CoreServer) -> None:
         trigger="cron",
         hour=hour,
         minute=minute,
-        timezone=tz,
         id="daily_briefing",
         replace_existing=True,
     )
-    print(f"[scheduler] Daily briefing scheduled at {DAILY_BRIEFING_TIME} {DAILY_BRIEFING_TZ}.")
+    print(f"[scheduler] Daily briefing scheduled at {DAILY_BRIEFING_TIME} {_BRIEFING_TZ_NAME}.")
 
 
 if __name__ == "__main__":
