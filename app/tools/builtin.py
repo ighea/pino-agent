@@ -123,8 +123,9 @@ def _eval_node(node: ast.AST) -> float:
 
 
 def _get_datetime() -> str:
-    now = datetime.datetime.now().astimezone()
-    return now.strftime("%A, %d %B %Y %H:%M:%S %Z")
+    from app.tz import TZ, TZ_NAME
+    now = datetime.datetime.now(TZ)
+    return now.strftime(f"%A, %d %B %Y %H:%M:%S {TZ_NAME}")
 
 
 def _calculate(expression: str) -> str:

@@ -5,16 +5,10 @@ import json
 import os
 import uuid
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 from app.tools.builtin import tool_manager
+from app.tz import TZ as _AGENT_TZ, TZ_NAME as _AGENT_TZ_NAME
 
 _REMINDERS_FILE = Path(os.getenv("REMINDERS_FILE", "data/reminders.json"))
-_AGENT_TZ_NAME = os.getenv("AGENT_TZ", "UTC")
-try:
-    _AGENT_TZ: datetime.tzinfo = ZoneInfo(_AGENT_TZ_NAME)
-except ZoneInfoNotFoundError:
-    _AGENT_TZ = datetime.timezone.utc
 
 _room_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "reminder_room_id", default=None
@@ -103,7 +97,7 @@ def _set_reminder(when: str, message: str) -> str:
         replace_existing=True,
     )
 
-    time_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+    time_str = dt.astimezone(_AGENT_TZ).strftime(f"%Y-%m-%d %H:%M {_AGENT_TZ_NAME}")
     return f"Reminder set for {time_str}: {message} (id: {reminder_id})"
 
 
@@ -138,7 +132,7 @@ tool_manager.register(
         "Schedule a reminder to be delivered at a specific time. "
         "The reminder message will be sent back to the conversation when it fires. "
         "Use ISO 8601 format for 'when' (e.g. 2026-06-23T15:00:00). "
-        "Times are interpreted as UTC unless the string includes a timezone offset. "
+        f"Times without a timezone offset are interpreted as {_AGENT_TZ_NAME}. "
         "Calculate the target time from the current date/time provided in the system prompt."
     ),
     parameters={

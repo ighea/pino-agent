@@ -4,8 +4,6 @@ import json
 import os
 import random
 import traceback
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 from app.llm.base import BaseLLM
 from app.logger import logger
 from app.tools.manager import ToolManager
@@ -17,16 +15,11 @@ from app.tools.reactions import set_react_fn
 from app.tools.reminder import set_reminder_context
 from app.tools.scheduled_tasks import set_scheduled_task_context
 from app.tools.share import set_deliver_fn
+from app.tz import TZ as _AGENT_TZ, TZ_NAME as _AGENT_TZ_NAME
 from app.tools.tasks import set_task_context
 from app.triggers.base import TriggerEvent
 
 AGENT_PERSONA = os.getenv("AGENT_PERSONA", "")
-_AGENT_TZ_NAME = os.getenv("AGENT_TZ", "UTC")
-try:
-    _AGENT_TZ = ZoneInfo(_AGENT_TZ_NAME)
-except ZoneInfoNotFoundError:
-    _AGENT_TZ = datetime.timezone.utc
-    _AGENT_TZ_NAME = "UTC"
 
 # Character budget for the messages list (excluding system prompt).
 # Derived from OLLAMA_NUM_CTX * ~4 chars/token, minus fixed overhead for
@@ -141,7 +134,12 @@ SYSTEM_PROMPT = (
 def _build_system_prompt() -> str:
     now = datetime.datetime.now(_AGENT_TZ)
     now_str = now.strftime(f"%A, %Y-%m-%d %H:%M {_AGENT_TZ_NAME}")
-    parts = [SYSTEM_PROMPT, f"Current date and time: {now_str}."]
+    parts = [
+        SYSTEM_PROMPT,
+        f"Current date and time: {now_str}. "
+        f"Your configured timezone is {_AGENT_TZ_NAME} — use it when interpreting or producing "
+        f"times, cron expressions, and ISO 8601 datetimes unless the user specifies otherwise.",
+    ]
     if AGENT_PERSONA:
         parts.append(f"Persona: {AGENT_PERSONA}")
     core = get_core_memories()
