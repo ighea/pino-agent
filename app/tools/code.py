@@ -11,6 +11,7 @@ so newly installed packages are immediately available to subsequent run_python c
 import asyncio
 import os
 import re
+import site
 import subprocess
 import sys
 import tempfile
@@ -86,8 +87,11 @@ def _run_python(code: str, timeout: int = _DEFAULT_TIMEOUT) -> str:
         env = {
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
-            # HOME points inside workspace so relative-home paths stay sandboxed
+            # HOME points inside workspace so relative-home paths stay sandboxed.
+            # PYTHONUSERBASE is set explicitly so Python can still find packages
+            # installed to the real ~/.local even when HOME is overridden.
             "HOME": str(WORKSPACE_DIR),
+            "PYTHONUSERBASE": site.getuserbase(),
         }
         if "PYTHONPATH" in os.environ:
             env["PYTHONPATH"] = os.environ["PYTHONPATH"]

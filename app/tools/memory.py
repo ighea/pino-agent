@@ -40,18 +40,32 @@ def _persist(data: dict) -> None:
 
 def _save_memory(key: str, value: str, category: str = "general", ttl_days: float | None = None) -> str:
     data = _load_live()
+    key = key.lower().strip()
+
+    # Avoid near-duplicate keys: if a semantically similar memory already exists
+    # under a different key, update that entry instead of creating a parallel one.
+    original_key = key
+    embedding = _embed(f"{key}: {value}")
+    if embedding is not None and key not in data:
+        for existing_key, existing_v in data.items():
+            if existing_v.get("embedding") and _cosine(embedding, existing_v["embedding"]) >= 0.85:
+                key = existing_key
+                break
+
     expires_at = None
     if ttl_days is not None and ttl_days > 0:
         expires_at = (datetime.datetime.now(_UTC) + datetime.timedelta(days=ttl_days)).isoformat()
-    data[key.lower().strip()] = {
+    data[key] = {
         "value": value,
         "category": category,
         "saved_at": datetime.datetime.now(_UTC).isoformat(),
         "expires_at": expires_at,
-        "embedding": _embed(f"{key}: {value}"),
+        "embedding": embedding,
     }
     _persist(data)
     suffix = f" (expires in {ttl_days} day{'s' if ttl_days != 1 else ''})" if ttl_days else ""
+    if key != original_key:
+        return f"Saved to '{key}' (merged near-duplicate of '{original_key}'): {value}{suffix}"
     return f"Saved: {key} = {value}{suffix}"
 
 
