@@ -7,7 +7,8 @@ pino/
 ├── main.py                      # Entry point — parse args, load .env, start server + scheduler
 ├── app/
 │   ├── server.py                # CoreServer: trigger registry + event dispatch
-│   ├── agent.py                 # AgentLoop: LLM ↔ tool call orchestration + quick ack
+│   ├── agent.py                 # AgentLoop: LLM ↔ tool call orchestration + quick ack + tool-result offloading
+│   ├── config.py                # Runtime flags (verbose); set via --verbose CLI flag or VERBOSE=1
 │   ├── summarizer.py            # Conversation summarization (char-based, preserves tool-call chains)
 │   ├── history.py               # Per-session history persistence (load/save to data/history/)
 │   ├── embed.py                 # Shared embedding utilities (embed(), cosine()) — used by memory + workspace index
@@ -28,16 +29,16 @@ pino/
 │       ├── memory.py            # save_memory, recall_memory, delete_memory (JSON + embeddings via app.embed)
 │       ├── reactions.py         # react tool (ContextVar-based, async)
 │       ├── fetch.py             # fetch_page tool (SSRF-safe web page text extraction)
-│       ├── background.py        # start_background_task tool (asyncio tasks, fire_proactive fallback)
+│       ├── background.py        # start/list/cancel background tasks + per-task JSONL logs; registry in _registry dict
 │       ├── files.py             # list_files, find_files, read_file, write_file, append_file, patch_file, download_file, search_files
 │       ├── share.py             # share_file tool (ContextVar-based, trigger-aware delivery)
 │       ├── calendar.py          # get_calendar_events (multi-calendar ICS, RRULE support)
 │       ├── reminder.py          # set_reminder, list_reminders, cancel_reminder (APScheduler date jobs)
 │       ├── monitor.py           # watch_url, unwatch_url, list_watches (APScheduler interval jobs)
 │       ├── scheduled_tasks.py   # create_scheduled_task, list_scheduled_tasks, cancel_scheduled_task (APScheduler interval/cron jobs)
-│       ├── subagent.py          # delegate_task (inline sub-agent with depth limit, parallel-friendly)
+│       ├── subagent.py          # delegate_task (inline sub-agent, depth limit, per-call JSONL logging)
 │       ├── tasks.py             # plan_steps, finish_step (ephemeral per-turn task tracking)
-│       ├── code.py              # run_python (sandboxed subprocess execution, workspace-only I/O)
+│       ├── code.py              # run_python (sandboxed subprocess), install_python_package (pip install)
 │       └── memory_consolidation.py  # consolidate_memories + scheduled job: learn from history, compact core memories
 ├── data/                        # Runtime data — gitignored; created automatically on first run
 │   ├── agent_history.jsonl      # Structured JSONL event log
@@ -49,7 +50,9 @@ pino/
 │   ├── workspace_index.json     # Vector index for search_files_semantic
 │   ├── history/                 # Per-session conversation history files
 │   ├── nio_store/               # Matrix E2EE session keys
+│   ├── logs/                    # Per-task background logs (bg_<id>.jsonl) and sub-agent logs (subagent_<id>.jsonl)
 │   └── workspace/               # Sandboxed file tool + code execution workspace
+│       └── tool_outputs/        # Large tool results offloaded here (see TOOL_RESULT_OFFLOAD_CHARS)
 ├── .env.example                 # Documents all env vars — copy to .env and fill in
 ├── .claudeignore                # Prevents Claude from reading .env and data/
 ├── requirements.txt
@@ -87,9 +90,11 @@ All callbacks are optional (can be `None`). The agent never knows or cares which
 3. If `fast_llm` is set and `respond_fn` is present, fire `_quick_ack()` as a concurrent asyncio task — it sends a short acknowledgment (with a topic emoji) before the main loop starts.
 4. Build `[system, …history, user]` message list. The system prompt includes the current datetime (in `AGENT_TZ`) and core memories so the LLM always has essential context.
 5. Call the primary LLM with all registered tool schemas (with exponential-backoff retry).
-6. If the response contains `tool_calls`: emit a status message, execute all tools concurrently via `asyncio.gather`, append `tool` result messages, then append a single `role: user` nudge message to anchor weak models that otherwise emit an empty stop token after tool use. The nudge is stripped from `event.history` before it is persisted.
+6. If the response contains `tool_calls`: emit a status message, execute all tools concurrently via `asyncio.gather`. Each result is passed through `_maybe_offload_tool_result`: results exceeding `TOOL_RESULT_OFFLOAD_CHARS` (default 1 500 chars) are written to `workspace/tool_outputs/<name>_<ts>_s<step>.txt` and replaced in the messages with a short reference + 300-char preview. The agent can call `read_file` to access the full content. After offloading, results still over `MAX_TOOL_RESULT_CHARS` are truncated. A `role: user` nudge message is appended to anchor weak models that otherwise emit an empty stop token after tool use; the nudge is stripped before history is persisted.
 7. If the response is plain text: call `event.respond_fn(text)` and return. Empty responses are retried up to 2 times before returning a user-facing error.
 8. If `finish_reason == "length"` (context overflow): strip history, keep only `[system, user, …tool_chain]`, retry once.
+
+When `app.config.verbose` is `True` (set by `--verbose` or `VERBOSE=1`), every LLM request and response is printed to stderr with clear separators, showing role/content/tool-calls for each message. Content longer than 600 characters is truncated for readability. This flag lives in `app/config.py` as a module-level bool, set at startup before the first request.
 
 At the end of a successful turn `event.history` is updated in-place with all messages from this turn (minus the system prompt). The caller (trigger) then persists this to disk.
 
@@ -130,7 +135,12 @@ Triggers load history from disk at the start of each event and save it after `ha
 
 ### Code execution sandbox
 
-`app/tools/code.py` implements `run_python(code, timeout)`. Before execution, a preamble is prepended to the user's code that:
+`app/tools/code.py` implements two tools:
+
+- **`run_python(code, timeout)`** — runs code in a sandboxed subprocess (see below)
+- **`install_python_package(package)`** — runs `sys.executable -m pip install --quiet <package>` in the main process. The package spec is validated against a safe-chars regex before passing to pip. Successfully installed packages are available to all subsequent `run_python` calls for the lifetime of the process.
+
+Before `run_python` execution, a preamble is prepended to the user's code that:
 
 - Overrides `builtins.open` with a path-checking wrapper — `realpath` is used so symlinks can't escape; both the exact workspace path and paths under it are allowed
 - Replaces `subprocess.run/Popen/call/…` and `os.system/popen/execv/…` with a `PermissionError`-raising stub
@@ -181,9 +191,15 @@ Scheduling mirrors the daily briefing: `setup_consolidation_schedule(server)` re
 
 `set_consolidation_server(server)` — called by `main.py` at startup — stores the server reference so the tool can invoke the agent loop.
 
-### Background task notifications
+### Background tasks
 
-`app/tools/background.py` now stores the `room_id` alongside the LLM, tools, and push_fn in ContextVars. When a background task completes it first tries `push_fn` (the `respond_fn` from the original request); if that fails or is absent it falls back to `fire_proactive(room_id, ...)`. The room_id is also injected into the background `TriggerEvent`'s metadata so reminders and watches set within the background task are associated with the correct room.
+`app/tools/background.py` maintains an in-memory registry (`_registry: dict[str, dict]`) mapping 8-char hex IDs to task state dicts (`id`, `prompt`, `status`, `created_at`, `started_at`, `completed_at`, `result`, `error`, `_task`). The `_task` key holds the live `asyncio.Task` and is not serialised.
+
+Status lifecycle: `pending` → `running` → `done | failed | cancelled`.
+
+On each lifecycle transition `_write_log(task_id, event, **data)` appends a JSONL entry to `BG_LOG_DIR/bg_<id>.jsonl` for post-mortem inspection. Four tools are registered: `start_background_task`, `list_background_tasks`, `cancel_background_task` (cancels the asyncio.Task), `get_task_log`.
+
+When a background task completes it first tries `push_fn` (the `respond_fn` from the original request); if that fails or is absent it falls back to `fire_proactive(room_id, ...)`. The `room_id` is injected into the background `TriggerEvent` metadata so reminders and watches set within the background task are associated with the correct room.
 
 ### Task planning
 
@@ -197,6 +213,8 @@ State is scoped per room and cleared at the start of every turn via `set_task_co
 ### Sub-agents
 
 `app/tools/subagent.py` implements `delegate_task`. It reads the LLM and tools from the ContextVars set by `set_background_context` (shared with background tasks), creates a fresh `TriggerEvent` with `source="subagent"`, and awaits a new `AgentLoop.run()` call directly — not as a separate asyncio task. The result string is returned to the calling agent's tool chain.
+
+Each call generates an 8-char hex `agent_id` and appends start/completed/failed events to `SUBAGENT_LOG_DIR/subagent_<id>.jsonl` (defaults to `BG_LOG_DIR`).
 
 A `_depth_var` ContextVar tracks nesting depth. Each `delegate_task` call increments it (using `ContextVar.reset` in a `finally` block) and rejects calls when depth ≥ `_MAX_DEPTH` (2). Because the agent loop runs all tool calls via `asyncio.gather` (which wraps each in a task that inherits the current context), multiple `delegate_task` calls in a single step execute concurrently while each independently tracks its own depth.
 
@@ -254,6 +272,10 @@ All file tools operate inside `WORKSPACE_DIR` (default: `data/workspace`). `_saf
 | `SUMMARY_KEEP_CHARS` | `4000` | Target chars of recent history to keep verbatim after summarizing |
 | `CODE_EXEC_TIMEOUT` | `30` | Default `run_python` timeout in seconds (hard cap: 120) |
 | `CODE_MAX_OUTPUT_CHARS` | `3000` | Truncate `run_python` output to this length |
+| `TOOL_RESULT_OFFLOAD_CHARS` | `1500` | Offload tool results larger than this to `workspace/tool_outputs/`; `0` disables |
+| `VERBOSE` | — | `1` to print all LLM requests/responses to stderr; also via `--verbose` CLI flag |
+| `BG_LOG_DIR` | `data/logs` | Directory for background task (`bg_*.jsonl`) and sub-agent (`subagent_*.jsonl`) log files |
+| `SUBAGENT_LOG_DIR` | `BG_LOG_DIR` | Override log directory for sub-agent calls |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
 | `HTTP_PORT` | `8000` | HTTP trigger port |
 | `HTTP_API_KEY` | — | Bearer token for HTTP auth; unset = open |
@@ -282,6 +304,7 @@ python main.py --mode cli --message "…" # one-shot
 python main.py --mode http             # HTTP only
 python main.py --mode matrix           # Matrix bot only
 python main.py --mode all              # all triggers concurrently
+python main.py --verbose               # print all LLM messages to stderr (any mode)
 ```
 
 Docker: `docker compose up` starts with `--mode all` by default.

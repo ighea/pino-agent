@@ -12,6 +12,28 @@ CALENDARS: dict[str, str] = {
     if key.upper().startswith("CALENDAR_") and val
 }
 
+# Optional: comma-separated list of the owner's email addresses, used to filter declined events
+USER_EMAILS: set[str] = {
+    e.strip().lower()
+    for e in os.environ.get("USER_EMAILS", "").split(",")
+    if e.strip()
+}
+
+
+def _user_declined(event) -> bool:
+    """Return True if any of the owner's emails has PARTSTAT=DECLINED on this event."""
+    attendees = event.get("ATTENDEE")
+    if attendees is None:
+        return False
+    if not isinstance(attendees, list):
+        attendees = [attendees]
+    for attendee in attendees:
+        cal_address = str(attendee).lower().removeprefix("mailto:")
+        if cal_address in USER_EMAILS:
+            if str(attendee.params.get("PARTSTAT", "")).upper() == "DECLINED":
+                return True
+    return False
+
 
 def _event_start(event) -> datetime.datetime:
     dt = event.get("DTSTART").dt
@@ -38,6 +60,8 @@ def _fetch_calendar(name: str, url: str, now: datetime.datetime, end: datetime.d
     results = []
     for event in events:
         if str(event.get("STATUS", "")).upper() == "CANCELLED":
+            continue
+        if USER_EMAILS and _user_declined(event):
             continue
         dt = event.get("DTSTART").dt
         results.append({

@@ -59,6 +59,10 @@ pip install -r requirements.txt
 | `SUMMARY_KEEP_CHARS` | `4000` | Target chars of recent history to keep verbatim after summarizing |
 | `CODE_EXEC_TIMEOUT` | `30` | Default `run_python` timeout in seconds (hard cap: 120) |
 | `CODE_MAX_OUTPUT_CHARS` | `3000` | Truncate `run_python` output to this length |
+| `TOOL_RESULT_OFFLOAD_CHARS` | `1500` | Tool results larger than this are saved to `workspace/tool_outputs/` and replaced with a file reference in the context window; set to `0` to disable |
+| `VERBOSE` | — | Set to `1` to print all LLM requests and responses to stderr; also available as `--verbose` CLI flag |
+| `BG_LOG_DIR` | `data/logs` | Directory for per-task background task and sub-agent JSONL log files |
+| `SUBAGENT_LOG_DIR` | `BG_LOG_DIR` | Override log directory for sub-agent calls specifically |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
 | `HTTP_PORT` | `8000` | HTTP trigger port |
 | `HTTP_API_KEY` | — | Bearer token for HTTP auth; unset = open |
@@ -70,6 +74,7 @@ pip install -r requirements.txt
 | `MATRIX_STORE_PATH` | `./data/nio_store` | Path for E2EE key storage |
 | `MATRIX_MAX_MSG_LEN` | `4000` | Split Matrix messages at this character count |
 | `CALENDAR_<name>` | — | ICS URL for a named calendar, e.g. `CALENDAR_WORK=https://…` |
+| `USER_EMAILS` | — | Comma-separated list of your email addresses; events you declined are filtered out |
 | `REMINDERS_FILE` | `data/reminders.json` | Persistent reminder store path |
 | `DAILY_BRIEFING_TIME` | — | `HH:MM` to send the daily briefing (unset = disabled) |
 | `DAILY_BRIEFING_TZ` | `UTC` | Timezone for `DAILY_BRIEFING_TIME`, e.g. `Europe/Helsinki` |
@@ -97,6 +102,9 @@ python main.py --mode matrix
 
 # All triggers concurrently
 python main.py --mode all
+
+# Verbose: print every LLM request and response to stderr
+python main.py --verbose
 ```
 
 ### CLI output
@@ -137,26 +145,31 @@ When total history character count exceeds `MAX_HISTORY_CHARS` (default 12 000),
 
 ## Code execution
 
-The agent can run Python code using the `run_python` tool. Code executes in a subprocess with:
+The agent can run Python code using `run_python`. Code executes in a subprocess with:
 
-- **Workspace-only file I/O** — `open()` is overridden to reject paths outside `WORKSPACE_DIR`; use relative paths or workspace-relative paths freely
+- **Workspace-only file I/O** — `open()` is overridden to reject paths outside `WORKSPACE_DIR`; use relative paths freely
 - **Subprocess and shell execution blocked** — `subprocess`, `os.system`, `os.popen`, `os.execv`, and related APIs raise `PermissionError`
 - **CPU time hard limit** — enforced at the OS level via `RLIMIT_CPU` on Linux, in addition to the `timeout` parameter
-- Standard library and all installed packages are available
+- All packages installed in the Python environment are available
+
+If a package is not yet installed, the agent calls `install_python_package` first, then proceeds with `run_python`:
 
 ```text
-> Calculate the 10 largest Fibonacci numbers under 1000 and save them to fib.txt
+> Plot a histogram of the numbers in data.csv using seaborn
 
+Installing Python package: seaborn
 Running Python code...
 
-Saved 10 Fibonacci numbers to fib.txt
+Histogram saved to histogram.png
 ```
 
 Set `CODE_EXEC_TIMEOUT` (default 30 s, max 120 s) and `CODE_MAX_OUTPUT_CHARS` (default 3000) to tune behaviour.
 
 ## Background tasks
 
-The agent can start long-running tasks that continue after the current response using the `start_background_task` tool. Results are delivered back to the user when the task completes — via the originating channel if still connected, or as a proactive notification otherwise. Tasks can optionally start after a delay.
+The agent can start long-running tasks that continue after the current response using `start_background_task`. Results are delivered back to the user when the task completes — via the originating channel if still connected, or as a proactive notification otherwise. Tasks can optionally start after a delay.
+
+Each task gets an 8-character ID. Use `list_background_tasks` to check status and results, `cancel_background_task` to abort, and `get_task_log` to inspect the detailed JSONL log written to `BG_LOG_DIR` (default: `data/logs/`). Sub-agent calls made via `delegate_task` are similarly logged to `data/logs/subagent_<id>.jsonl`.
 
 ## Recurring scheduled tasks
 
@@ -260,6 +273,12 @@ CALENDAR_WORK=https://calendar.google.com/calendar/ical/…
 ```
 
 Get ICS URLs from Google Calendar → Settings → (calendar) → *Secret address in iCal format*.
+
+Set `USER_EMAILS` to a comma-separated list of your email addresses so that events you have declined are automatically filtered out:
+
+```bash
+USER_EMAILS=you@personal.com,you@work.com
+```
 
 The `get_calendar_events` tool fetches upcoming events from all configured calendars (or a named subset), merges them chronologically, and labels each with its calendar name. Recurring events are fully expanded.
 
@@ -409,7 +428,11 @@ All users in a room share the same conversation history. The agent sees messages
 | `recall_memory(query?)` | Semantic + keyword search over stored memories | `EMBEDDING_MODEL` (optional) |
 | `delete_memory(key)` | Remove a stored memory by key | — |
 | `run_python(code, timeout?)` | Execute Python in a sandboxed subprocess; workspace-only file I/O, subprocess blocked | — |
+| `install_python_package(package)` | Install a pip package so it becomes available to `run_python`; accepts any pip specifier | — |
 | `start_background_task(task, delay_seconds?)` | Run a task asynchronously; delivers result to user when done (proactive fallback if original channel is gone) | — |
+| `list_background_tasks()` | List all background tasks with status (pending/running/done/failed/cancelled), timestamps, and result previews | — |
+| `cancel_background_task(task_id)` | Cancel a running or pending background task by its 8-char ID | — |
+| `get_task_log(task_id)` | Read the detailed JSONL event log for a background task | — |
 | `delegate_task(prompt)` | Delegate a sub-task to a fresh agent instance; returns result inline for chaining | — |
 | `plan_steps(steps)` | Create an ordered task checklist for the current request; agent works through it with `finish_step` | — |
 | `finish_step(index, notes?)` | Mark a step done with an outcome note; returns updated checklist and next action | — |
@@ -528,5 +551,7 @@ All generated runtime files are kept under `data/` and gitignored as a single en
 | `data/workspace_index.json` | Vector index for semantic workspace search |
 | `data/nio_store/` | Matrix E2EE session keys |
 | `data/workspace/` | Sandboxed workspace for file tools and code execution |
+| `data/workspace/tool_outputs/` | Large tool results offloaded here automatically (see `TOOL_RESULT_OFFLOAD_CHARS`) |
+| `data/logs/` | Per-task background task logs (`bg_<id>.jsonl`) and sub-agent logs (`subagent_<id>.jsonl`) |
 
-Override individual paths via their respective env vars (`AGENT_LOG_FILE`, `MEMORY_FILE`, `REMINDERS_FILE`, `WATCHES_FILE`, `HISTORY_DIR`, `WORKSPACE_INDEX_FILE`, `MATRIX_STORE_PATH`, `WORKSPACE_DIR`).
+Override individual paths via their respective env vars (`AGENT_LOG_FILE`, `MEMORY_FILE`, `REMINDERS_FILE`, `WATCHES_FILE`, `HISTORY_DIR`, `WORKSPACE_INDEX_FILE`, `MATRIX_STORE_PATH`, `WORKSPACE_DIR`, `BG_LOG_DIR`).

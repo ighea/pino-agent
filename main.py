@@ -13,13 +13,13 @@ from app.tools.builtin import tool_manager
 import app.tools.memory      # registers memory tools onto tool_manager
 import app.tools.reactions   # registers react tool onto tool_manager
 import app.tools.fetch       # registers fetch_page tool onto tool_manager
-import app.tools.background  # registers start_background_task tool onto tool_manager
+import app.tools.background  # registers start_background_task, list_background_tasks, cancel_background_task, get_task_log
 import app.tools.files       # registers list_files, find_files, read_file, write_file onto tool_manager
 import app.tools.share       # registers share_file onto tool_manager
 import app.tools.calendar    # registers get_calendar_events onto tool_manager
 import app.tools.reminder    # registers set_reminder, list_reminders, cancel_reminder onto tool_manager
 import app.workspace_index   # registers search_files_semantic onto tool_manager
-import app.tools.code        # registers run_python onto tool_manager
+import app.tools.code        # registers run_python, install_python_package onto tool_manager
 import app.tools.monitor     # registers watch_url, unwatch_url, list_watches onto tool_manager
 import app.tools.scheduled_tasks  # registers create_scheduled_task, list_scheduled_tasks, cancel_scheduled_task onto tool_manager
 import app.tools.subagent    # registers delegate_task onto tool_manager
@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
         "--interactive",
         action="store_true",
         help="Force interactive CLI mode even when --message is given.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print all messages sent to the LLM and responses received (useful for debugging).",
     )
     parser.add_argument(
         "--host",
@@ -81,6 +86,10 @@ TEXT_TOOL_CALLING = os.getenv("LLM_TEXT_TOOL_CALLING", "1") == "1"
 
 
 async def run(args: argparse.Namespace) -> None:
+    import app.config as _app_config
+    if args.verbose:
+        _app_config.verbose = True
+
     llm: BaseLLM = OpenAIProvider()
     if TEXT_TOOL_CALLING:
         llm = TextToolCallingLLM(llm)
