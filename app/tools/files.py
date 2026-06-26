@@ -1,4 +1,5 @@
 import os
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -273,6 +274,31 @@ def _patch_file(path: str, start_line: int, end_line: int, content: str) -> str:
     )
 
 
+def _delete_file(path: str, recursive: bool = False) -> str:
+    _ensure_workspace()
+    target = _safe_path(path)
+    if target is None:
+        return "Error: path is outside the workspace."
+    if not target.exists():
+        return f"Error: '{path}' does not exist."
+    if target.is_file() or target.is_symlink():
+        target.unlink()
+        return f"Deleted file '{path}'."
+    if target.is_dir():
+        if recursive:
+            shutil.rmtree(target)
+            return f"Deleted directory '{path}' and all its contents."
+        try:
+            target.rmdir()
+            return f"Deleted empty directory '{path}'."
+        except OSError:
+            return (
+                f"Error: '{path}' is a non-empty directory. "
+                "Set recursive=true to delete it and all its contents."
+            )
+    return f"Error: '{path}' is not a file or directory."
+
+
 tool_manager.register(
     name="list_files",
     fn=_list_files,
@@ -483,4 +509,29 @@ tool_manager.register(
         "required": ["path", "content"],
     },
     status_template="Writing file: {path}",
+)
+
+tool_manager.register(
+    name="delete_file",
+    fn=_delete_file,
+    description=(
+        "Delete a file or directory from the workspace. "
+        "For directories, set recursive=true to delete them along with all contents; "
+        "otherwise only empty directories are deleted."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file or directory to delete, relative to workspace root.",
+            },
+            "recursive": {
+                "type": "boolean",
+                "description": "If true, delete a directory and all its contents. Defaults to false.",
+            },
+        },
+        "required": ["path"],
+    },
+    status_template="Deleting: {path}",
 )

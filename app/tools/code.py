@@ -1,12 +1,16 @@
-"""Sandboxed Python code execution.
+"""Sandboxed Python code execution and package installation.
 
 Code runs in a subprocess with the workspace as its working directory.
 File I/O is restricted to the workspace via an injected preamble that overrides
 builtins.open. Subprocess and shell-execution APIs are disabled in the same preamble.
+
+install_python_package runs pip install in the main process (outside the sandbox),
+so newly installed packages are immediately available to subsequent run_python calls.
 """
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -148,9 +152,9 @@ tool_manager.register(
     description=(
         "Execute Python code in a sandboxed subprocess and return stdout + stderr. "
         "The code runs inside the workspace directory — file I/O is restricted to the workspace "
-        "and subprocess/shell execution is disabled. Use relative paths or workspace-relative paths "
-        "to read and write files. "
-        "Standard library and all installed packages are available. "
+        "and subprocess/shell execution is disabled. Use relative paths to read and write files. "
+        "All packages installed in the Python environment are available. "
+        "If a needed package is missing, call install_python_package first, then run your code. "
         "Use this for data analysis, calculations, CSV/JSON processing, generating plots "
         "(save images to the workspace with matplotlib), string manipulation, and similar tasks. "
         "Use print() to produce output. Execution is capped at `timeout` seconds (default 30, max 120)."
@@ -170,4 +174,56 @@ tool_manager.register(
         "required": ["code"],
     },
     status_template="Running Python code...",
+)
+
+# Only allow safe PyPI package specifications: names, versions, extras.
+_SAFE_PKG_RE = re.compile(r'^[A-Za-z0-9_.+\-\[\]>=<!~,\s;]+$')
+
+
+def _install_python_package(package: str) -> str:
+    package = package.strip()
+    if not package:
+        return "Error: package specification is empty."
+    if not _SAFE_PKG_RE.match(package):
+        return f"Error: invalid package specification: {package!r}"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", package],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return "Error: pip install timed out after 120s."
+    except Exception as e:
+        return f"Error: {e}"
+    if result.returncode == 0:
+        return f"Successfully installed: {package}"
+    # Show the tail of stderr which contains the actual error message
+    error = (result.stderr or result.stdout or "unknown error").strip()
+    if len(error) > 600:
+        error = "[...]\n" + error[-600:]
+    return f"pip install failed for '{package}':\n{error}"
+
+
+tool_manager.register(
+    name="install_python_package",
+    fn=_install_python_package,
+    description=(
+        "Install a Python package via pip so it becomes available to run_python. "
+        "Accepts any valid pip package specification, e.g. 'requests', 'pandas>=2.0', "
+        "'scipy[extra]'. The installation is persistent for the lifetime of the process. "
+        "Call this before run_python when the required package is not yet installed."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "package": {
+                "type": "string",
+                "description": "Package name or pip specifier, e.g. 'numpy', 'httpx>=0.27', 'pillow[jpeg]'.",
+            },
+        },
+        "required": ["package"],
+    },
+    status_template="Installing Python package: {package}",
 )

@@ -189,9 +189,16 @@ def load_and_schedule_pending(server) -> None:
     global _server_ref
     _server_ref = server
     from app import scheduler as sched
-    for task_id, task in _load_tasks().items():
+    tasks = _load_tasks()
+    for task_id, task in tasks.items():
         try:
             _schedule_job(task_id, task, sched.get_scheduler())
+            label = task.get("label") or task["prompt"][:40]
+            if task.get("interval_minutes"):
+                freq = f"every {task['interval_minutes']}min"
+            else:
+                freq = f"cron '{task.get('cron_expr', '?')}'"
+            print(f"[scheduler] Scheduled task '{label}' loaded ({freq}).")
         except Exception:
             pass
 

@@ -72,6 +72,12 @@ def _search_images(query: str, count: int = 5) -> str:
     return "\n\n".join(lines)
 
 
+def _wind_cardinal(deg: float) -> str:
+    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    return dirs[round(deg / 22.5) % 16]
+
+
 def _get_weather(location: str, units: str = "metric") -> str:
     if not OWM_API_KEY:
         return "Error: OPENWEATHERMAP_API_KEY environment variable is not set."
@@ -91,12 +97,31 @@ def _get_weather(location: str, units: str = "metric") -> str:
         return f"Error: OpenWeatherMap returned HTTP {resp.status_code}."
     d = resp.json()
     unit_symbol = "°C" if units == "metric" else "°F"
-    return (
-        f"{d['name']}, {d['sys']['country']}: {d['weather'][0]['description'].capitalize()}. "
-        f"Temp: {d['main']['temp']}{unit_symbol} (feels like {d['main']['feels_like']}{unit_symbol}). "
-        f"Humidity: {d['main']['humidity']}%. "
-        f"Wind: {d['wind']['speed']} {'m/s' if units == 'metric' else 'mph'}."
-    )
+    speed_unit = "m/s" if units == "metric" else "mph"
+
+    main = d.get("main", {})
+    wind = d.get("wind", {})
+    visibility = d.get("visibility")  # metres, may be absent
+
+    temp = round(main.get("temp", 0), 1)
+    feels_like = round(main.get("feels_like", 0), 1)
+    humidity = main.get("humidity", "?")
+    pressure = main.get("pressure", "?")
+    wind_speed = round(wind.get("speed", 0), 1)
+    wind_info = f"{wind_speed} {speed_unit}"
+    if "deg" in wind:
+        wind_info += f" {_wind_cardinal(wind['deg'])}"
+
+    parts = [
+        f"{d['name']}, {d['sys']['country']}: {d['weather'][0]['description'].capitalize()}.",
+        f"Temperature: {temp}{unit_symbol} (feels like {feels_like}{unit_symbol}).",
+        f"Humidity: {humidity}%.  Pressure: {pressure} hPa.",
+        f"Wind: {wind_info}.",
+    ]
+    if visibility is not None:
+        parts.append(f"Visibility: {round(visibility / 1000, 1)} km.")
+
+    return "  ".join(parts)
 
 
 _OPS = {
@@ -152,11 +177,19 @@ tool_manager.register(
 tool_manager.register(
     name="search_web",
     fn=_search_web,
-    description="Search the web using Brave Search and return a list of relevant results with titles, URLs, and descriptions.",
+    description=(
+        "Search the web using Brave Search and return titles, URLs, and descriptions. "
+        "Use this for current events, factual lookups, or any question that requires up-to-date information. "
+        "Follow up with fetch_page on a specific result URL to read the full content of a page."
+    ),
     parameters={
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "The search query."},
+            "count": {
+                "type": "integer",
+                "description": "Number of results to return (default 5, max 20). Increase for broader coverage.",
+            },
         },
         "required": ["query"],
     },
@@ -183,7 +216,11 @@ tool_manager.register(
 tool_manager.register(
     name="get_weather",
     fn=_get_weather,
-    description="Get current weather conditions for a city or location.",
+    description=(
+        "Get current weather conditions for a city or location. "
+        "Returns temperature (°C by default), feels-like, humidity, pressure, wind speed and direction, "
+        "and visibility. Use units='imperial' for °F and mph."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -194,7 +231,7 @@ tool_manager.register(
             "units": {
                 "type": "string",
                 "enum": ["metric", "imperial"],
-                "description": "Temperature units: 'metric' (°C) or 'imperial' (°F). Default is metric.",
+                "description": "Temperature units: 'metric' (Celsius, m/s) or 'imperial' (Fahrenheit, mph). Default: metric.",
             },
         },
         "required": ["location"],
