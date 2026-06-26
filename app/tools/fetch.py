@@ -34,10 +34,13 @@ def _check_url(url: str) -> str | None:
     return None
 
 
-def _fetch_page(url: str) -> str:
+def _fetch_page(url: str, format: str = "text") -> str:
     err = _check_url(url)
     if err:
         return f"Error: {err}"
+
+    if format not in ("text", "markdown"):
+        return f"Error: unsupported format '{format}'. Use 'text' or 'markdown'."
 
     try:
         resp = _requests.get(
@@ -58,9 +61,17 @@ def _fetch_page(url: str) -> str:
         if err:
             return f"Error: Redirect target blocked — {err}"
 
-    content_type = resp.headers.get("content-type", "")
-    if not content_type.startswith("text/"):
-        return f"Error: Unsupported content type '{content_type}'. Only text pages can be fetched."
+    content_type = resp.headers.get("content-type", "").lower()
+    _ALLOWED_TYPES = (
+        "text/",
+        "application/json",
+        "application/xml",
+        "application/atom+xml",
+        "application/rss+xml",
+        "application/xhtml+xml",
+    )
+    if not any(content_type.startswith(t) for t in _ALLOWED_TYPES):
+        return f"Error: Unsupported content type '{content_type}'. Only HTML, JSON, and XML pages can be fetched."
 
     # Read up to _MAX_BYTES
     chunks = []
@@ -70,18 +81,31 @@ def _fetch_page(url: str) -> str:
         chunks.append(chunk)
         if total >= _MAX_BYTES:
             break
-    raw_html = b"".join(chunks)[:_MAX_BYTES].decode("utf-8", errors="replace")
+    raw_content = b"".join(chunks)[:_MAX_BYTES].decode("utf-8", errors="replace")
 
-    text = trafilatura.extract(raw_html, include_links=False, include_images=False)
-    if not text:
-        # Fallback: strip tags with stdlib
-        import html
-        import re
-        text = html.unescape(re.sub(r"<[^>]+>", " ", raw_html))
-        text = re.sub(r"\s+", " ", text).strip()
+    is_html = "html" in content_type
+    use_markdown = format == "markdown"
+
+    if is_html:
+        text = trafilatura.extract(
+            raw_content,
+            output_format="markdown" if use_markdown else "txt",
+            include_links=use_markdown,
+            include_tables=True,
+            include_images=False,
+        )
+        if not text:
+            # Fallback: strip tags with stdlib (plain text only)
+            import html as _html
+            import re
+            text = _html.unescape(re.sub(r"<[^>]+>", " ", raw_content))
+            text = re.sub(r"\s+", " ", text).strip()
+    else:
+        # JSON, XML, plain text — return content as-is
+        text = raw_content.strip()
 
     if not text:
-        return "Error: Could not extract readable text from the page."
+        return "Error: Could not extract readable content from the page."
 
     if len(text) > 8000:
         text = text[:8000] + "\n[content truncated]"
@@ -96,9 +120,13 @@ tool_manager.register(
     name="fetch_page",
     fn=_fetch_page,
     description=(
-        "Fetch the readable text content of a web page. "
+        "Fetch content from a web page. "
         "Use after search_web when you need the full content of a specific result. "
-        "Private or internal addresses are blocked. Returns extracted main-body text only."
+        "Private or internal addresses are blocked. "
+        "format='text' (default) returns extracted plain text — good for reading articles. "
+        "format='markdown' returns the page as Markdown, preserving headings, links, lists, "
+        "and tables — use this when document structure matters (documentation, reference pages, "
+        "comparison tables, navigation hierarchies)."
     ),
     parameters={
         "type": "object",
@@ -106,6 +134,15 @@ tool_manager.register(
             "url": {
                 "type": "string",
                 "description": "The full URL to fetch, e.g. 'https://example.com/article'.",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["text", "markdown"],
+                "description": (
+                    "'text' (default): plain text, CSS/scripts stripped, boilerplate removed. "
+                    "'markdown': structured output with headings, links, lists, and tables preserved — "
+                    "use when the page layout carries information (docs, tables, multi-section pages)."
+                ),
             },
         },
         "required": ["url"],

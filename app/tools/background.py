@@ -38,6 +38,7 @@ _room_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _registry: dict[str, dict] = {}
 
 _BG_LOG_DIR = Path(os.getenv("BG_LOG_DIR", "data/logs"))
+_REGISTRY_FILE = Path(os.getenv("BG_REGISTRY_FILE", "data/task_registry.json"))
 _UTC = datetime.timezone.utc
 
 
@@ -50,6 +51,38 @@ def set_background_context(llm, tools, push_fn, room_id: str | None = None) -> N
 
 def _now_iso() -> str:
     return datetime.datetime.now(_UTC).isoformat()
+
+
+def _save_registry() -> None:
+    """Persist the registry (minus asyncio.Task references) to disk."""
+    try:
+        _REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        serialisable = {
+            tid: {k: v for k, v in entry.items() if k != "_task"}
+            for tid, entry in _registry.items()
+        }
+        _REGISTRY_FILE.write_text(
+            json.dumps(serialisable, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _load_registry() -> None:
+    """Restore persisted task history on startup; interrupted tasks are marked accordingly."""
+    if not _REGISTRY_FILE.exists():
+        return
+    try:
+        data = json.loads(_REGISTRY_FILE.read_text(encoding="utf-8"))
+        for tid, entry in data.items():
+            if entry.get("status") in ("pending", "running"):
+                entry["status"] = "interrupted"
+            _registry[tid] = entry
+    except Exception:
+        pass
+
+
+_load_registry()
 
 
 def _write_log(task_id: str, event: str, **data) -> None:
@@ -83,7 +116,7 @@ async def _run_task(
     delay: float,
     room_id: str | None,
 ) -> None:
-    from app.agent import AgentLoop
+    from app.agent import AgentLoop, build_subtask_system_prompt
     from app.triggers.base import TriggerEvent
 
     entry = _registry[task_id]
@@ -94,6 +127,7 @@ async def _run_task(
     entry["status"] = "running"
     entry["started_at"] = _now_iso()
     _write_log(task_id, "started", prompt=prompt)
+    _save_registry()
 
     event = TriggerEvent(
         input=prompt,
@@ -102,22 +136,27 @@ async def _run_task(
                   else {"bg_task_id": task_id}),
     )
     try:
-        result = await AgentLoop(llm=llm, tools=tools).run(event)
+        result = await AgentLoop(
+            llm=llm, tools=tools, system_prompt_fn=build_subtask_system_prompt
+        ).run(event)
         entry["status"] = "done"
         entry["result"] = result
         entry["completed_at"] = _now_iso()
         _write_log(task_id, "completed", result=result)
+        _save_registry()
         await _notify(push_fn, room_id, f"**[Background task complete]**\n{result}")
     except asyncio.CancelledError:
         entry["status"] = "cancelled"
         entry["completed_at"] = _now_iso()
         _write_log(task_id, "cancelled")
+        _save_registry()
         raise
     except Exception as e:
         entry["status"] = "failed"
         entry["error"] = str(e)
         entry["completed_at"] = _now_iso()
         _write_log(task_id, "failed", error=str(e))
+        _save_registry()
         await _notify(push_fn, room_id, f"**[Background task failed]** {e}")
 
 
@@ -148,6 +187,7 @@ async def _start_background_task(task: str, delay_seconds: float = 0) -> str:
         _run_task(task_id, task, push_fn, llm, tools, delay_seconds, room_id)
     )
     _registry[task_id]["_task"] = asyncio_task
+    _save_registry()
 
     if delay_seconds > 0:
         m, s = divmod(int(delay_seconds), 60)
@@ -190,6 +230,7 @@ async def _cancel_background_task(task_id: str) -> str:
     entry["status"] = "cancelled"
     entry["completed_at"] = _now_iso()
     _write_log(task_id, "cancelled_by_user")
+    _save_registry()
     return f"Background task `{task_id}` cancelled."
 
 

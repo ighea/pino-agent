@@ -56,23 +56,56 @@ class _Response:
 # Patterns for tool calls embedded inside plain-text content
 # ---------------------------------------------------------------------------
 
-# {"name": "tool_name", "arguments": {...}}  — top-level JSON object
-_JSON_TOOL_RE = re.compile(
-    r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}',
-    re.DOTALL,
-)
 # ```json\n{...}\n```
 _CODEBLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
+def _find_json_objects(content: str) -> list[str]:
+    """Extract all top-level JSON object strings using brace counting (handles nesting)."""
+    result = []
+    depth = 0
+    start = -1
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(content):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    result.append(content[start : i + 1])
+                    start = -1
+    return result
+
+
 def _extract_embedded_tool_call(content: str) -> _ToolCall | None:
     """Try to find a tool call encoded in plain text content."""
+    seen: set[str] = set()
     candidates: list[str] = []
 
-    for m in _JSON_TOOL_RE.finditer(content):
-        candidates.append(m.group(0))
+    for span in _find_json_objects(content):
+        if span not in seen:
+            seen.add(span)
+            candidates.append(span)
     for m in _CODEBLOCK_RE.finditer(content):
-        candidates.append(m.group(1))
+        span = m.group(1)
+        if span not in seen:
+            seen.add(span)
+            candidates.append(span)
 
     for raw in candidates:
         try:

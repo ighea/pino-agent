@@ -57,7 +57,7 @@ async def _delegate_task(prompt: str) -> str:
 
     token = _depth_var.set(depth + 1)
     try:
-        from app.agent import AgentLoop
+        from app.agent import AgentLoop, build_subtask_system_prompt
         from app.triggers.base import TriggerEvent
 
         room_id = _room_id_var.get()
@@ -67,7 +67,9 @@ async def _delegate_task(prompt: str) -> str:
             metadata=({"room_id": room_id, "subagent_id": agent_id} if room_id
                       else {"subagent_id": agent_id}),
         )
-        result = await AgentLoop(llm=llm, tools=tools).run(event)
+        result = await AgentLoop(
+            llm=llm, tools=tools, system_prompt_fn=build_subtask_system_prompt
+        ).run(event)
         _write_subagent_log(agent_id, "completed", result=result or "(no output)")
         return result or "(sub-agent returned no output)"
     except Exception as e:
