@@ -1,5 +1,8 @@
 import asyncio
+import traceback
 from typing import Callable
+
+from app.logger import logger
 
 
 class ToolManager:
@@ -47,6 +50,10 @@ class ToolManager:
             result = self._tools[name]["fn"](**kwargs)
             return str(result)
         except Exception as e:
+            logger.log_error(
+                f"Tool '{name}' raised an exception",
+                {"tool": name, "args": kwargs, "error": str(e), "traceback": traceback.format_exc()},
+            )
             return f"Error: tool '{name}' raised an exception: {e}"
 
     def is_async(self, name: str) -> bool:
@@ -60,6 +67,10 @@ class ToolManager:
             result = await self._tools[name]["fn"](**kwargs)
             return str(result)
         except Exception as e:
+            logger.log_error(
+                f"Tool '{name}' raised an exception",
+                {"tool": name, "args": kwargs, "error": str(e), "traceback": traceback.format_exc()},
+            )
             return f"Error: tool '{name}' raised an exception: {e}"
 
     def list_tools(self) -> list[str]:

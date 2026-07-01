@@ -14,6 +14,26 @@ WORKSPACE_DIR = Path(
 _MAX_READ_BYTES = 100_000   # 100 KB
 _MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 _DOWNLOAD_TIMEOUT = 30
+# PDFs are binary-heavy (fonts, images) relative to their text content, so they get
+# a much larger source-size allowance than plain text files before extraction is skipped.
+_MAX_PDF_SOURCE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _extract_text(path: Path) -> str | None:
+    """Return a file's text content, extracting PDF text via pypdf. None if unreadable."""
+    if path.suffix.lower() == ".pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(str(path))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            text = "\n\n".join(p.strip() for p in pages if p.strip())
+            return text or None
+        except Exception:
+            return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return None
 
 
 def _safe_path(user_path: str) -> Path | None:
@@ -73,19 +93,31 @@ def _read_file(path: str, start_line: int | None = None, end_line: int | None = 
     if not target.is_file():
         return f"Error: '{path}' is not a file."
 
+    is_pdf = target.suffix.lower() == ".pdf"
     partial = start_line is not None or end_line is not None
     size = target.stat().st_size
 
-    if not partial and size > _MAX_READ_BYTES:
-        return (
-            f"Error: file too large ({size} bytes; limit is {_MAX_READ_BYTES}). "
-            "Use start_line/end_line to read a specific range."
-        )
-
-    try:
-        text = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return "Error: file is not valid UTF-8 text."
+    if is_pdf:
+        if size > _MAX_PDF_SOURCE_BYTES:
+            return (
+                f"Error: PDF too large to extract text from ({size:,} bytes; "
+                f"limit is {_MAX_PDF_SOURCE_BYTES:,})."
+            )
+        text = _extract_text(target)
+        if text is None:
+            return (
+                "Error: could not extract text from this PDF "
+                "(it may be scanned/image-only, encrypted, or corrupted)."
+            )
+    else:
+        if not partial and size > _MAX_READ_BYTES:
+            return (
+                f"Error: file too large ({size} bytes; limit is {_MAX_READ_BYTES}). "
+                "Use start_line/end_line to read a specific range."
+            )
+        text = _extract_text(target)
+        if text is None:
+            return "Error: file is not valid UTF-8 text."
 
     if not partial:
         return text
@@ -176,11 +208,11 @@ def _search_files(query: str, path: str = ".", case_sensitive: bool = False) -> 
     for file in sorted(target.rglob("*")):
         if not file.is_file():
             continue
-        if file.stat().st_size > _MAX_READ_BYTES:
+        size_limit = _MAX_PDF_SOURCE_BYTES if file.suffix.lower() == ".pdf" else _MAX_READ_BYTES
+        if file.stat().st_size > size_limit:
             continue
-        try:
-            text = file.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+        text = _extract_text(file)
+        if text is None:
             continue
 
         lines = text.splitlines()
@@ -343,7 +375,8 @@ tool_manager.register(
     name="read_file",
     fn=_read_file,
     description=(
-        "Read the text content of a file in the workspace. "
+        "Read the text content of a file in the workspace. PDF files are automatically "
+        "extracted to text. "
         "Use start_line and end_line to read a specific range instead of the whole file — "
         "useful for large files or when search_files has already located the relevant lines. "
         "Positive line numbers are 1-based; negative numbers count from the end (-1 = last line, -20 = last 20 lines)."
@@ -404,7 +437,8 @@ tool_manager.register(
     name="search_files",
     fn=_search_files,
     description=(
-        "Search for a text string across all files in the workspace. "
+        "Search for a text string across all files in the workspace, including PDFs "
+        "(text is extracted automatically). "
         "Returns matching filenames and the lines containing the match. "
         "Use this to find relevant information in notes, reports, or other files you have previously written."
     ),

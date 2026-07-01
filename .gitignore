@@ -1,4 +1,5 @@
 .aider*
 __pycache__
 .env
+.venv
 data/

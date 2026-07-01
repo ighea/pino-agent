@@ -61,6 +61,8 @@ pip install -r requirements.txt
 | `CODE_MAX_OUTPUT_CHARS` | `3000` | Truncate `run_python` output to this length |
 | `TOOL_RESULT_OFFLOAD_CHARS` | `1500` | Tool results larger than this are saved to `workspace/tool_outputs/` and replaced with a file reference in the context window; set to `0` to disable |
 | `VERBOSE` | — | Set to `1` to print all LLM requests and responses to stderr; also available as `--verbose` CLI flag |
+| `MAX_CONCURRENT_TOOLS` | `6` | Maximum tool executions running at once, process-wide — bounds fan-out across steps, `delegate_task` sub-agents, and background tasks |
+| `MAX_LOG_VALUE_CHARS` | `4000` | Truncate long values before writing to `AGENT_LOG_FILE` so the log can't grow unbounded from large tool results |
 | `BG_LOG_DIR` | `data/logs` | Directory for per-task background task and sub-agent JSONL log files |
 | `SUBAGENT_LOG_DIR` | `BG_LOG_DIR` | Override log directory for sub-agent calls specifically |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
@@ -135,7 +137,7 @@ ollama pull qwen2.5:1.5b
 
 ## Conversation history
 
-Conversation history is persisted per session so it survives process restarts. Each Matrix room and each HTTP `session_id` gets its own file under `HISTORY_DIR` (default: `data/history/`). Up to `MAX_PERSISTED_HISTORY` messages (default 200) are kept per file; older messages are dropped when the file is written.
+Conversation history is persisted per session so it survives process restarts. Each Matrix room and each HTTP `session_id` gets its own file under `HISTORY_DIR` (default: `data/history/`). Up to `MAX_PERSISTED_HISTORY` messages (default 200) are kept per file; older messages are dropped when the file is written, always in whole assistant/tool-call groups so a trimmed file never leaves an orphaned tool result.
 
 Concurrent messages to the same room are serialized via a per-room async lock so history is always consistent.
 
@@ -441,13 +443,13 @@ All users in a room share the same conversation history. The agent sees messages
 | `cancel_scheduled_task(task_id)` | Cancel a recurring scheduled task by ID | — |
 | `list_files(path?)` | List files and directories in the workspace | — |
 | `find_files(pattern)` | Glob search in the workspace, e.g. `**/*.md` | — |
-| `read_file(path, start_line?, end_line?)` | Read a text file from the workspace (100 KB limit; range supported) | — |
+| `read_file(path, start_line?, end_line?)` | Read a text file from the workspace (100 KB limit; range supported); PDFs are text-extracted automatically (20 MB source limit) | — |
 | `write_file(path, content)` | Write or overwrite a file in the workspace | — |
 | `append_file(path, content)` | Append text to a workspace file without overwriting | — |
 | `patch_file(path, start_line, end_line, content)` | Replace a line range in a workspace file | — |
 | `download_file(url, path)` | Download a file from a URL into the workspace (50 MB limit) | — |
-| `search_files(query, path?, case_sensitive?)` | Keyword search across workspace files with line snippets | — |
-| `search_files_semantic(query, path?)` | Semantic search across workspace files using vector similarity | `EMBEDDING_MODEL` |
+| `search_files(query, path?, case_sensitive?)` | Keyword search across workspace files, including PDFs, with line snippets | — |
+| `search_files_semantic(query, path?)` | Semantic search across workspace files, including PDFs, using vector similarity | `EMBEDDING_MODEL` |
 | `share_file(path)` | Deliver a workspace file to the user via the appropriate channel | — |
 | `get_calendar_events(days_ahead?, calendars?)` | Upcoming events from configured ICS calendars | `CALENDAR_*` |
 | `set_reminder(when, message)` | Schedule a reminder for a specific ISO 8601 datetime | — |
@@ -473,9 +475,15 @@ All users in a room share the same conversation history. The agent sees messages
 
 `recall_memory` computes cosine similarity between the query embedding and stored memory embeddings (using `nomic-embed-text` via Ollama). Entries with similarity ≥ 0.35 are returned. If embeddings are unavailable, it falls back to keyword matching.
 
+`memory.json` is written atomically (temp file + rename) so a crash or a concurrent write can never leave it half-written. If it's ever found corrupted anyway, the loader recovers whatever valid JSON prefix it can rather than failing every subsequent turn.
+
 ### Semantic workspace search
 
 `search_files_semantic` builds a vector index of workspace files on demand (stored in `WORKSPACE_INDEX_FILE`). Files are split into 400-character overlapping chunks, each embedded and cached with the file's modification time. Stale chunks are re-embedded the next time the tool is called. Use this for concept and topic queries; use `search_files` for exact keyword matches.
+
+### PDF support
+
+`read_file`, `search_files`, and `search_files_semantic` all extract PDF text automatically via `pypdf` — the same library the Matrix trigger already uses for PDF attachments (see [Image and file input](#image-and-file-input)). PDFs get a larger size allowance than plain text (20 MB source vs. 100 KB / 50 KB) since they're binary-heavy relative to their text content. Scanned/image-only, encrypted, or corrupted PDFs return a clear error (or are silently skipped by the search tools) rather than failing indexing.
 
 ### Web page fetching safety
 
@@ -483,7 +491,7 @@ All users in a room share the same conversation history. The agent sees messages
 
 - Resolves hostnames and rejects private, loopback, link-local, and reserved IP ranges (including after redirects)
 - `fetch_page` only processes `text/*` responses
-- `fetch_page` reads at most 50 KB of HTML, truncates extracted text to 8 000 characters; `download_file` stops at 50 MB
+- `fetch_page` reads at most 300 KB of HTML; extracted text is not separately truncated — large results are automatically offloaded to `workspace/tool_outputs/` (see `TOOL_RESULT_OFFLOAD_CHARS` above) and can be paged through with `read_file`; `download_file` stops at 50 MB
 - `trafilatura` strips navigation, ads, and boilerplate; falls back to stdlib tag-stripping
 - Fetched content is labelled `[UNTRUSTED EXTERNAL CONTENT]` and the system prompt instructs the agent never to follow instructions found in fetched pages
 
@@ -530,10 +538,25 @@ Subclass `BaseTrigger` from `app/triggers/base.py`, implement `start(server)` an
 ## Docker
 
 ```bash
-docker compose up --build
+docker compose build
+docker compose up -d
 ```
 
-The compose file passes `.env` variables through to the container. The default mode is `all` (CLI + HTTP + Matrix).
+The image builds a dedicated venv at `/code/.venv` from `requirements.txt` (kept alive across the `.:/code` bind mount via the `pino-venv` named volume, so it isn't wiped out by mounting your working copy over `/code`). The compose file passes `.env` variables through to the container.
+
+By default (`RUN_MODE=bash`) the container just idles in a shell so you can attach to it:
+
+```bash
+docker compose exec dev bash        # interactive shell
+docker compose exec dev /code/pino  # run the agent ad hoc
+```
+
+To run the agent as the container's main process instead:
+
+```bash
+RUN_MODE=pino docker compose up -d
+docker compose exec dev bash        # still available for debugging alongside it
+```
 
 ## Data directory
 

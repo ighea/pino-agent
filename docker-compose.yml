@@ -9,6 +9,7 @@ services:
     working_dir: /code
     volumes:
       - .:/code
+      - pino-venv:/code/.venv
       - user-home:/home/dev
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -28,9 +29,15 @@ services:
       HTTP_API_KEY: "${HTTP_API_KEY:-}"
       AIDER_CONFIG: /code/aider.json
       AGENT_TZ: "${AGENT_TZ:-UTC}"
-    command: python main.py --mode all
+      RUN_MODE: "${RUN_MODE:-bash}"
+    # RUN_MODE=bash (default): idle shell, `docker compose exec dev bash` or
+    #   `docker compose exec dev /code/pino` to run the agent ad hoc.
+    # RUN_MODE=pino: container's main process is the agent itself, e.g.
+    #   `RUN_MODE=pino docker compose up -d`. Still exec-able with bash.
+    command: ["bash", "-c", "if [ \"$$RUN_MODE\" = \"pino\" ]; then exec /code/pino; else exec bash; fi"]
     stdin_open: true
     tty: true
 
 volumes:
+  pino-venv:
   user-home:

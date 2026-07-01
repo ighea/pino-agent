@@ -7,6 +7,7 @@ import sys
 import traceback
 from app.llm.base import BaseLLM
 from app.logger import logger
+from app.message_groups import TOOL_RESULT_NUDGE as _TOOL_RESULT_NUDGE, atomic_groups
 import app.config as _app_config
 from app.tools.manager import ToolManager
 from app.summarizer import maybe_summarize, summarize_all
@@ -38,9 +39,10 @@ _MAX_MESSAGES_CHARS = int(os.getenv("MAX_MESSAGES_CHARS", str(_NUM_CTX * 4 - 16_
 _MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "3000"))
 # Maximum wall-clock seconds for a single agent turn (all steps combined). 0 = no limit.
 _AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT_SECONDS", "0"))
-# Added as a user message after tool results to keep weak models anchored to the task.
-# Using a user role message is more effective than embedding the nudge in tool result content.
-_TOOL_RESULT_NUDGE = "(Tool calls complete. Now write your response to the user's question. Do not greet the user.)"
+# Maximum number of tool executions running concurrently across the whole process
+# (top-level steps, nested delegate_task sub-agents, and background tasks all share it).
+_MAX_CONCURRENT_TOOLS = int(os.getenv("MAX_CONCURRENT_TOOLS", "6"))
+_tool_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_TOOLS)
 
 _THINKING_PHRASES = [
     "Thinking...",
@@ -126,6 +128,27 @@ def _maybe_offload_tool_result(result: str, name: str, step: int) -> str:
         return result
 
 
+def _strip_images(messages: list[dict]) -> list[dict]:
+    """Replace image_url content in history messages with a short placeholder.
+
+    Multimodal user messages (list content with image_url parts) are stored in
+    history after an image turn. Without stripping, the base64 blob re-enters
+    every subsequent LLM call and consumes the entire context budget.
+    """
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            text_parts = [p for p in content if p.get("type") != "image_url"]
+            has_image = len(text_parts) < len(content)
+            if has_image:
+                text_parts.append({"type": "text", "text": "[image]"})
+            out.append({**m, "content": text_parts})
+        else:
+            out.append(m)
+    return out
+
+
 def _msg_char_len(m: dict) -> int:
     return len(str(m.get("content") or "")) + len(str(m.get("tool_calls") or ""))
 
@@ -149,26 +172,7 @@ def _trim_messages(messages: list[dict], preserve_from: int = -1) -> list[dict]:
     if total <= _MAX_MESSAGES_CHARS:
         return messages
 
-    # Build atomic groups from index 1 up to (not including) preserve_from.
-    # assistant+tool_calls → all following tool results → optional nudge = one group.
-    groups: list[list[int]] = []
-    i = 1
-    while i < preserve_from:
-        m = messages[i]
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            group = [i]
-            j = i + 1
-            while j < preserve_from and messages[j].get("role") == "tool":
-                group.append(j)
-                j += 1
-            if j < preserve_from and messages[j].get("content") == _TOOL_RESULT_NUDGE:
-                group.append(j)
-                j += 1
-            groups.append(group)
-            i = j
-        else:
-            groups.append([i])
-            i += 1
+    groups = atomic_groups(messages, 1, preserve_from)
 
     original_total = total
     drop_set: set[int] = set()
@@ -204,20 +208,12 @@ async def _compress_tool_chain(
     cycles to compress or the LLM call fails.
     """
     # Locate tool-call cycle boundaries after the user input at turn_start.
-    cycles: list[tuple[int, int]] = []  # (start, end) where messages[start:end] is one cycle
-    i = turn_start + 1
-    while i < len(messages):
-        m = messages[i]
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            j = i + 1
-            while j < len(messages) and messages[j].get("role") == "tool":
-                j += 1
-            if j < len(messages) and messages[j].get("content") == _TOOL_RESULT_NUDGE:
-                j += 1
-            cycles.append((i, j))
-            i = j
-        else:
-            i += 1
+    groups = atomic_groups(messages, turn_start + 1, len(messages))
+    cycles: list[tuple[int, int]] = [
+        (g[0], g[-1] + 1)
+        for g in groups
+        if messages[g[0]].get("role") == "assistant" and messages[g[0]].get("tool_calls")
+    ]
 
     if len(cycles) <= keep_recent_cycles:
         return None
@@ -296,11 +292,8 @@ SYSTEM_PROMPT = (
 
 
 def _build_system_prompt() -> str:
-    now = datetime.datetime.now(_AGENT_TZ)
-    now_str = now.strftime(f"%A, %Y-%m-%d %H:%M {_AGENT_TZ_NAME}")
     parts = [
         SYSTEM_PROMPT,
-        f"Current date and time: {now_str}. "
         f"Your configured timezone is {_AGENT_TZ_NAME} — use it when interpreting or producing "
         f"times, cron expressions, and ISO 8601 datetimes unless the user specifies otherwise.",
     ]
@@ -337,11 +330,9 @@ _SUBTASK_SYSTEM_PROMPT = (
 
 def build_subtask_system_prompt() -> str:
     """Slim system prompt for background tasks and sub-agents."""
-    now = datetime.datetime.now(_AGENT_TZ)
-    now_str = now.strftime(f"%A, %Y-%m-%d %H:%M {_AGENT_TZ_NAME}")
     parts = [
         _SUBTASK_SYSTEM_PROMPT,
-        f"Current date and time: {now_str} ({_AGENT_TZ_NAME}).",
+        f"Timezone: {_AGENT_TZ_NAME}.",
     ]
     core = get_core_memories()
     if core:
@@ -456,19 +447,29 @@ class AgentLoop:
         name = tc.function.name
         try:
             args = json.loads(tc.function.arguments)
-        except json.JSONDecodeError:
-            args = {}
+        except json.JSONDecodeError as e:
+            logger.log_error(
+                "Tool call arguments were not valid JSON",
+                {"tool": name, "raw_arguments": tc.function.arguments, "error": str(e)},
+            )
+            return (
+                tc.id,
+                name,
+                f"Error: arguments for '{name}' were not valid JSON ({e}). "
+                "Re-check the argument syntax and try again.",
+            )
         await self._status(event, self.tools.get_status(name, args))
         logger.log_tool_call(name, args)
-        try:
-            if self.tools.is_async(name):
-                result = await self.tools.async_call(name, **args)
-            else:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda n=name, a=args: self.tools.call(n, **a)
-                )
-        except Exception as e:
-            result = f"Error: tool '{name}' raised an exception: {e}"
+        async with _tool_semaphore:
+            try:
+                if self.tools.is_async(name):
+                    result = await self.tools.async_call(name, **args)
+                else:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda n=name, a=args: self.tools.call(n, **a)
+                    )
+            except Exception as e:
+                result = f"Error: tool '{name}' raised an exception: {e}"
         logger.log_tool_response(name, result)
         return tc.id, name, result
 
@@ -492,9 +493,12 @@ class AgentLoop:
         if self.fast_llm and event.respond_fn and event.source not in ("scheduler", "background"):
             asyncio.create_task(self._quick_ack(event))
 
+        now_str = datetime.datetime.now(_AGENT_TZ).strftime(f"%A, %Y-%m-%d %H:%M {_AGENT_TZ_NAME}")
+
         messages: list[dict] = [
             {"role": "system", "content": self._system_prompt_fn()},
-            *event.history,
+            {"role": "system", "content": f"Current time: {now_str}"},
+            *_strip_images(event.history),
             {"role": "user", "content": event.input},
         ]
         # Index of the current user message — used to strip history on context overflow.
@@ -583,7 +587,11 @@ class AgentLoop:
             final = (msg.content or "").strip()
             if not final:
                 messages.pop()
-                if choice.finish_reason == "length" and not _history_stripped:
+                # Ollama models can report an empty response with a finish_reason other
+                # than "length" even on context overflow — fall back to the same strip/
+                # summarize recovery once empty retries are exhausted, before giving up.
+                overflow_suspected = choice.finish_reason == "length" or empty_retries >= _max_empty_retries
+                if overflow_suspected and not _history_stripped:
                     history_slice = [
                         m for m in messages[1:_turn_start]
                         if m.get("content") != _TOOL_RESULT_NUDGE
@@ -624,7 +632,8 @@ class AgentLoop:
             logger.log_final_output(final)
             # Persist conversation turns (excluding system prompt and ephemeral nudge messages)
             event.history.clear()
-            event.history.extend(m for m in messages[1:] if m.get("content") != _TOOL_RESULT_NUDGE)
+            raw = [m for m in messages[1:] if m.get("content") != _TOOL_RESULT_NUDGE]
+            event.history.extend(_strip_images(raw))
             return final
 
         return "I wasn't able to complete a response. Please try again."

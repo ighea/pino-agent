@@ -2,7 +2,8 @@
 
 Files are chunked and embedded on demand when search_files_semantic is called.
 The index is persisted to WORKSPACE_INDEX_FILE so embeddings survive restarts.
-Only UTF-8 text files under _MAX_FILE_BYTES are indexed.
+UTF-8 text files under _MAX_FILE_BYTES are indexed; PDFs under _MAX_PDF_SOURCE_BYTES
+have their text extracted via pypdf (see app.tools.files._extract_text).
 """
 
 import json
@@ -49,11 +50,13 @@ def _save_index(index: dict) -> None:
 
 def _index_file(path: Path, rel: str, index: dict) -> bool:
     """Embed and store chunks for one file. Returns True if the index was updated."""
-    if not path.is_file() or path.stat().st_size > _MAX_FILE_BYTES:
+    from app.tools.files import _extract_text, _MAX_PDF_SOURCE_BYTES
+
+    size_limit = _MAX_PDF_SOURCE_BYTES if path.suffix.lower() == ".pdf" else _MAX_FILE_BYTES
+    if not path.is_file() or path.stat().st_size > size_limit:
         return False
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError):
+    text = _extract_text(path)
+    if text is None:
         return False
 
     mtime = path.stat().st_mtime
@@ -132,10 +135,11 @@ tool_manager.register(
     name="search_files_semantic",
     fn=_search_files_semantic,
     description=(
-        "Search workspace files using natural-language or concept-based queries "
-        "via semantic (vector) similarity. Use this when you want to find files "
-        "related to a topic or idea rather than a specific keyword — for example, "
-        "'budget projections', 'meeting notes about the product launch', or 'Python scripts'. "
+        "Search workspace files (including PDFs, which are text-extracted automatically) "
+        "using natural-language or concept-based queries via semantic (vector) similarity. "
+        "Use this when you want to find files related to a topic or idea rather than a "
+        "specific keyword — for example, 'budget projections', 'meeting notes about the "
+        "product launch', or 'Python scripts'. "
         "For exact keyword/string search use search_files instead. "
         "Returns the most relevant text chunks with their file paths."
     ),
