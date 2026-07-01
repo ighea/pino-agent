@@ -3,6 +3,21 @@ import os
 import json
 from pathlib import Path
 
+# Long values (e.g. a fetched web page or file dump passed as a tool argument/result)
+# are truncated before being written to the log so the JSONL file doesn't grow unbounded.
+_MAX_LOG_VALUE_CHARS = int(os.getenv("MAX_LOG_VALUE_CHARS", "4000"))
+
+
+def _truncate_for_log(value, max_chars: int = _MAX_LOG_VALUE_CHARS):
+    if isinstance(value, str) and len(value) > max_chars:
+        return value[:max_chars] + f"... [truncated, {len(value):,} chars total]"
+    if isinstance(value, dict):
+        return {k: _truncate_for_log(v, max_chars) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_truncate_for_log(v, max_chars) for v in value]
+    return value
+
+
 class AgentLogger:
     """
     Manages logging and history persistence for the agent framework.

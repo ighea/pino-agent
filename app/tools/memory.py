@@ -1,21 +1,50 @@
 import datetime
 import json
 import os
+import threading
 
 from app.embed import cosine as _cosine
 from app.embed import embed as _embed
+from app.logger import logger
 from app.tools.builtin import tool_manager
 
 MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
 
 _UTC = datetime.timezone.utc
+# Sync tools run via asyncio's default ThreadPoolExecutor (see agent.py's
+# run_in_executor), so concurrent save_memory/delete_memory calls are real OS
+# threads racing on the same file — this serializes writes to prevent torn writes.
+_lock = threading.Lock()
 
 
 def _load() -> dict:
     if not os.path.exists(MEMORY_FILE):
         return {}
     with open(MEMORY_FILE) as f:
-        return json.load(f)
+        raw = f.read()
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        # A previous non-atomic write could have left a complete JSON document
+        # followed by leftover bytes from a racing write. Recover the valid
+        # leading document rather than failing every single agent turn.
+        try:
+            data, end = json.JSONDecoder().raw_decode(raw)
+        except json.JSONDecodeError:
+            logger.log_error(
+                "memory.json is corrupted and could not be recovered — "
+                "starting from an empty memory store",
+                {"path": MEMORY_FILE, "error": str(e)},
+            )
+            return {}
+        logger.log_error(
+            "memory.json had trailing corruption after a valid JSON document — "
+            "recovered the valid prefix",
+            {"path": MEMORY_FILE, "error": str(e), "valid_prefix_chars": end, "total_chars": len(raw)},
+        )
+        return data
 
 
 def _load_live() -> dict:
@@ -34,8 +63,13 @@ def _load_live() -> dict:
 
 
 def _persist(data: dict) -> None:
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """Write atomically (temp file + rename) so a crash or a racing writer can
+    never leave the file half-written or with leftover trailing bytes."""
+    tmp_path = f"{MEMORY_FILE}.tmp"
+    with _lock:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, MEMORY_FILE)
 
 
 def _save_memory(key: str, value: str, category: str = "general", ttl_days: float | None = None) -> str:

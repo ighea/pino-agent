@@ -17,6 +17,7 @@ from nio import (
     RoomMessageText,
     UploadError,
 )
+from nio.events.room_events import RoomEncryptedFile, RoomEncryptedImage
 
 import app.history as _history
 from app.logger import logger
@@ -29,6 +30,15 @@ MATRIX_ROOM_IDS = [r.strip() for r in os.getenv("MATRIX_ROOM_IDS", "").split(","
 MATRIX_STORE_PATH = os.getenv("MATRIX_STORE_PATH", "./nio_store")
 MATRIX_MAX_MSG_LEN = int(os.getenv("MATRIX_MAX_MSG_LEN", "4000"))
 _FILE_TEXT_MAX = 8000  # max chars extracted from file content
+
+# Keywords that signal a text message is referring to a previously shared image.
+# Matched as substrings so plural/inflected forms are caught automatically.
+_IMAGE_KEYWORDS = frozenset({
+    # English
+    "image", "photo", "picture", "pic", "screenshot",
+    # Finnish
+    "kuva", "kuvaa", "kuvassa", "kuvan",
+})
 
 
 def _split_message(text: str) -> list[str]:
@@ -96,6 +106,8 @@ class MatrixTrigger(BaseTrigger):
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._mention_prefixes: list[str] = []
         self._start_ms: int = 0
+        # Latest image per room: room_id -> (base64_data, mime_type, filename)
+        self._room_last_image: dict[str, tuple[str, str, str]] = {}
 
     async def start(self, server) -> None:
         self._server = server
@@ -148,7 +160,9 @@ class MatrixTrigger(BaseTrigger):
         self._client.add_event_callback(self._on_undecryptable, MegolmEvent)
         self._client.add_event_callback(self._on_message, RoomMessageText)
         self._client.add_event_callback(self._on_image, RoomMessageImage)
+        self._client.add_event_callback(self._on_image, RoomEncryptedImage)
         self._client.add_event_callback(self._on_file, RoomMessageFile)
+        self._client.add_event_callback(self._on_file, RoomEncryptedFile)
 
         # Register proactive send handler so scheduler can push to Matrix rooms
         from app import scheduler as _sched
@@ -229,18 +243,23 @@ class MatrixTrigger(BaseTrigger):
                 return None
 
             data: bytes = dl.body
+            # event.mimetype is set from the room event's info block and is always correct.
+            # dl.content_type is always "application/octet-stream" for encrypted files, so
+            # check event.mimetype first.
             mime_type: str = (
-                getattr(dl, "content_type", None)
-                or getattr(event, "mimetype", None)
+                getattr(event, "mimetype", None)
+                or getattr(dl, "content_type", None)
                 or "application/octet-stream"
             )
 
             if encrypted_file:
                 from nio.crypto import decrypt_attachment
-                key = base64.urlsafe_b64decode(encrypted_file["key"]["k"] + "==")
-                iv = base64.urlsafe_b64decode(encrypted_file["iv"] + "==")
-                sha256 = encrypted_file["hashes"]["sha256"]
-                data = decrypt_attachment(data, key, sha256, iv)
+                data = decrypt_attachment(
+                    data,
+                    encrypted_file["key"]["k"],
+                    encrypted_file["hashes"]["sha256"],
+                    encrypted_file["iv"],
+                )
                 mime_type = encrypted_file.get("mimetype", mime_type)
 
             return data, mime_type
@@ -254,7 +273,10 @@ class MatrixTrigger(BaseTrigger):
         if result is None:
             return None
         data, mime_type = result
-        return base64.b64encode(data).decode(), mime_type
+        magic = data[:4].hex() if len(data) >= 4 else "short"
+        b64 = base64.b64encode(data).decode()
+        print(f"[matrix] image decoded: {len(data)} bytes, magic={magic}, mime={mime_type}, b64_len={len(b64)}")
+        return b64, mime_type
 
     async def _proactive_send(self, room_id: str | None, text: str) -> None:
         """Send a proactive message to one room or all configured rooms."""
@@ -397,9 +419,15 @@ class MatrixTrigger(BaseTrigger):
                     await self._server.handle_event(trigger_event)
                     _history.save(captured_room_id, trigger_event.history)
                     asyncio.create_task(react_fn("✅"))
-                except Exception:
+                except Exception as e:
+                    # This runs as a fire-and-forget task (asyncio.create_task below) with
+                    # nobody awaiting it — re-raising here would only surface as an
+                    # unretrieved-task warning on stderr, so log it properly instead.
+                    logger.log_error(
+                        "Unhandled error handling Matrix event",
+                        {"room": captured_room_id, "sender": matrix_event.sender, "error": str(e)},
+                    )
                     asyncio.create_task(react_fn("❌"))
-                    raise
                 finally:
                     typing_task.cancel()
                     await self._client.room_typing(captured_room_id, typing_state=False)
@@ -435,8 +463,30 @@ class MatrixTrigger(BaseTrigger):
             return
 
         sender_name = room.user_name(event.sender) or event.sender
+        cached_image = self._room_last_image.get(room.room_id)
+        if cached_image and self._refers_to_image(message, room.room_id):
+            b64, mime_type, filename = cached_image
+            prefix = f"[{sender_name}]: " if not is_dm else ""
+            text_part = f"{prefix}{message}".strip()
+            print(f"[matrix] injecting cached image '{filename}' for message: {message!r}")
+            multimodal_input: list = [
+                {"type": "text", "text": text_part},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+            ]
+            await self._fire_event(room, event, multimodal_input)
+            return
+
         input_text = f"[{sender_name}]: {message}" if not is_dm else message
         await self._fire_event(room, event, input_text)
+
+    def _refers_to_image(self, text: str, room_id: str) -> bool:
+        """Return True if text seems to reference a previously shared image."""
+        lower = text.lower()
+        # Explicit filename reference
+        cached = self._room_last_image.get(room_id)
+        if cached and cached[2].lower() in lower:
+            return True
+        return any(kw in lower for kw in _IMAGE_KEYWORDS)
 
     async def _on_image(self, room, event) -> None:
         print(f"[matrix] image event: sender={event.sender}")
@@ -445,30 +495,17 @@ class MatrixTrigger(BaseTrigger):
         if event.sender == self._client.user_id:
             return
 
-        is_dm = len(room.users) == 2
-        body = event.body.strip()
-
-        if not is_dm:
-            if not self._is_mentioned(event, body):
-                return
-            caption = self._strip_prefix(body) if body else ""
-        else:
-            caption = body
-
+        # Download and cache regardless of mention so a follow-up text message
+        # like "@pino describe the last image" can reference it.
         image_data = await self._download_image(event)
         if image_data is None:
+            print(f"[matrix] image download failed for event {event.event_id}")
             return
 
         b64, mime_type = image_data
-        sender_name = room.user_name(event.sender) or event.sender
-        prefix = f"[{sender_name}]: " if not is_dm else ""
-        text_part = f"{prefix}{caption}".strip() or "Describe this image."
-
-        multimodal_input: list = [
-            {"type": "text", "text": text_part},
-            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
-        ]
-        await self._fire_event(room, event, multimodal_input)
+        filename = event.body.strip() or "image"
+        self._room_last_image[room.room_id] = (b64, mime_type, filename)
+        print(f"[matrix] image cached: filename={filename!r} mime={mime_type} room={room.room_id}")
 
     async def _on_file(self, room, event) -> None:
         print(f"[matrix] file event: sender={event.sender} body={getattr(event, 'body', '?')!r}")

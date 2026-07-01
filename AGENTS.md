@@ -11,6 +11,7 @@ pino/
 │   ├── config.py                # Runtime flags (verbose); set via --verbose CLI flag or VERBOSE=1
 │   ├── summarizer.py            # Conversation summarization (char-based, preserves tool-call chains)
 │   ├── history.py               # Per-session history persistence (load/save to data/history/)
+│   ├── message_groups.py        # Shared atomic-grouping helper (assistant+tool_calls+results+nudge) used by agent.py and history.py
 │   ├── embed.py                 # Shared embedding utilities (embed(), cosine()) — used by memory + workspace index
 │   ├── workspace_index.py       # On-demand vector index over workspace files + search_files_semantic tool
 │   ├── logger.py                # Structured JSONL logging → data/agent_history.jsonl
@@ -26,11 +27,11 @@ pino/
 │   └── tools/
 │       ├── manager.py           # ToolManager: registry, schema generation, sync/async dispatch
 │       ├── builtin.py           # search_web, search_images, get_weather, calculate, get_datetime + shared tool_manager
-│       ├── memory.py            # save_memory, recall_memory, delete_memory (JSON + embeddings via app.embed)
+│       ├── memory.py            # save_memory, recall_memory, delete_memory (JSON + embeddings via app.embed); atomic writes + corrupt-file recovery
 │       ├── reactions.py         # react tool (ContextVar-based, async)
 │       ├── fetch.py             # fetch_page tool (SSRF-safe web page text extraction)
 │       ├── background.py        # start/list/cancel background tasks + per-task JSONL logs; registry in _registry dict
-│       ├── files.py             # list_files, find_files, read_file, write_file, append_file, patch_file, download_file, search_files
+│       ├── files.py             # list_files, find_files, read_file, write_file, append_file, patch_file, download_file, search_files, delete_file; shared _extract_text() (PDF via pypdf)
 │       ├── share.py             # share_file tool (ContextVar-based, trigger-aware delivery)
 │       ├── calendar.py          # get_calendar_events (multi-calendar ICS, RRULE support)
 │       ├── reminder.py          # set_reminder, list_reminders, cancel_reminder (APScheduler date jobs)
@@ -90,9 +91,11 @@ All callbacks are optional (can be `None`). The agent never knows or cares which
 3. If `fast_llm` is set and `respond_fn` is present, fire `_quick_ack()` as a concurrent asyncio task — it sends a short acknowledgment (with a topic emoji) before the main loop starts.
 4. Build `[system, …history, user]` message list. The system prompt includes the current datetime (in `AGENT_TZ`) and core memories so the LLM always has essential context.
 5. Call the primary LLM with all registered tool schemas (with exponential-backoff retry).
-6. If the response contains `tool_calls`: emit a status message, execute all tools concurrently via `asyncio.gather`. Each result is passed through `_maybe_offload_tool_result`: results exceeding `TOOL_RESULT_OFFLOAD_CHARS` (default 1 500 chars) are written to `workspace/tool_outputs/<name>_<ts>_s<step>.txt` and replaced in the messages with a short reference + 300-char preview. The agent can call `read_file` to access the full content. After offloading, results still over `MAX_TOOL_RESULT_CHARS` are truncated. A `role: user` nudge message is appended to anchor weak models that otherwise emit an empty stop token after tool use; the nudge is stripped before history is persisted.
+6. If the response contains `tool_calls`: emit a status message, execute all tools concurrently via `asyncio.gather`, each bounded by a process-wide `asyncio.Semaphore` (`MAX_CONCURRENT_TOOLS`, default 6) so a step with many tool calls — or nested `delegate_task`/background-task fan-out — can't flood the LLM backend. Each result is passed through `_maybe_offload_tool_result`: results exceeding `TOOL_RESULT_OFFLOAD_CHARS` (default 1 500 chars) are written to `workspace/tool_outputs/<name>_<ts>_s<step>.txt` and replaced in the messages with a short reference + 300-char preview. The agent can call `read_file` to access the full content. After offloading, results still over `MAX_TOOL_RESULT_CHARS` are truncated. A `role: user` nudge message is appended to anchor weak models that otherwise emit an empty stop token after tool use; the nudge is stripped before history is persisted.
 7. If the response is plain text: call `event.respond_fn(text)` and return. Empty responses are retried up to 2 times before returning a user-facing error.
-8. If `finish_reason == "length"` (context overflow): strip history, keep only `[system, user, …tool_chain]`, retry once.
+8. If `finish_reason == "length"` (context overflow): strip history, keep only `[system, user, …tool_chain]`, retry once. The same strip/summarize recovery also fires as a last resort once empty-response retries are exhausted, regardless of `finish_reason`, since Ollama models don't always report `"length"` on overflow.
+
+Atomic tool-call groups (an `assistant` message with `tool_calls`, its `tool` results, and the trailing nudge) are identified via `app/message_groups.py`'s `atomic_groups()`, shared between `_trim_messages`/`_compress_tool_chain` in `agent.py` and `history.py`'s save-time capping — a group is always kept or dropped as a unit so a `tool` message is never orphaned from its `assistant.tool_calls`.
 
 When `app.config.verbose` is `True` (set by `--verbose` or `VERBOSE=1`), every LLM request and response is printed to stderr with clear separators, showing role/content/tool-calls for each message. Content longer than 600 characters is truncated for readability. This flag lives in `app/config.py` as a module-level bool, set at startup before the first request.
 
@@ -109,7 +112,7 @@ Per-request state (`react_fn`, `deliver_fn`, `llm`, `tools`, `push_fn` for backg
 `app/history.py` provides two functions:
 
 - `load(session_id) -> list[dict]` — reads `data/history/<safe_id>.json`; returns `[]` if missing
-- `save(session_id, history)` — writes up to `MAX_PERSISTED_HISTORY` (default 200) messages
+- `save(session_id, history)` — writes up to `MAX_PERSISTED_HISTORY` (default 200) messages, capped via `message_groups.atomic_groups()` so the cut never splits an assistant/tool-call group
 
 Session IDs are sanitized (non-alphanumeric chars replaced with `_`) before use as filenames. Matrix triggers use `room_id` as the session ID; HTTP triggers use the caller-supplied `session_id`.
 
@@ -127,11 +130,15 @@ Triggers load history from disk at the start of each event and save it after `ha
 
 `app/workspace_index.py` maintains a JSON vector index at `WORKSPACE_INDEX_FILE`. When `search_files_semantic` is called:
 
-1. All workspace files under the target path are scanned (max 50 files, max 50 KB per file).
+1. All workspace files under the target path are scanned (max 50 files, max 50 KB per file — PDFs get a 20 MB allowance instead, see below).
 2. Files with a stale or missing mtime in the index are re-chunked (400-char chunks, 80-char overlap, max 20 chunks per file) and re-embedded.
 3. The updated index is saved to disk.
 4. The query is embedded and cosine similarity is computed against all stored chunks.
 5. Top-5 chunks with score ≥ 0.35 are returned with file path, relevance score, and a 300-char snippet.
+
+### PDF text extraction
+
+`app/tools/files.py`'s `_extract_text(path)` is the shared entry point for reading file content across `read_file`, `search_files`, and `workspace_index.py`'s `_index_file`: plain files go through `.read_text(encoding="utf-8")`, `.pdf` files go through `pypdf.PdfReader` (same pattern as the Matrix trigger's PDF attachment handling), joining per-page `extract_text()` output. Returns `None` on any failure (non-UTF-8 text, scanned/encrypted/corrupted PDF, missing pypdf) so callers can distinguish "unreadable" from "empty". PDFs use the larger `_MAX_PDF_SOURCE_BYTES` (20 MB) size gate instead of `_MAX_READ_BYTES`/`_MAX_FILE_BYTES` since they're binary-heavy relative to their text content.
 
 ### Code execution sandbox
 
@@ -229,6 +236,8 @@ A `_depth_var` ContextVar tracks nesting depth. Each `delegate_task` call increm
 - `get_openai_schemas()` — returns the list of tool schemas for the LLM
 - `get_status(name, args)` — formats the status message from the template
 
+Both `call()` and `async_call()` catch any exception raised by the tool, log it via `logger.log_error` (message, args, traceback), and return `"Error: tool '<name>' raised an exception: <e>"` as the tool result so a bug in one tool is visible in `data/agent_history.jsonl` instead of only reaching the model as a string.
+
 The shared `tool_manager` instance lives in `app/tools/builtin.py` and is imported by all tool modules.
 
 ### Workspace file tools
@@ -274,6 +283,8 @@ All file tools operate inside `WORKSPACE_DIR` (default: `data/workspace`). `_saf
 | `CODE_MAX_OUTPUT_CHARS` | `3000` | Truncate `run_python` output to this length |
 | `TOOL_RESULT_OFFLOAD_CHARS` | `1500` | Offload tool results larger than this to `workspace/tool_outputs/`; `0` disables |
 | `VERBOSE` | — | `1` to print all LLM requests/responses to stderr; also via `--verbose` CLI flag |
+| `MAX_CONCURRENT_TOOLS` | `6` | Max tool executions running at once, process-wide (bounds step fan-out, sub-agents, background tasks) |
+| `MAX_LOG_VALUE_CHARS` | `4000` | Truncate long values before writing to `AGENT_LOG_FILE` |
 | `BG_LOG_DIR` | `data/logs` | Directory for background task (`bg_*.jsonl`) and sub-agent (`subagent_*.jsonl`) log files |
 | `SUBAGENT_LOG_DIR` | `BG_LOG_DIR` | Override log directory for sub-agent calls |
 | `HTTP_HOST` | `0.0.0.0` | HTTP trigger bind host |
